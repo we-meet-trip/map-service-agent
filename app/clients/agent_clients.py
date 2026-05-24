@@ -1,13 +1,15 @@
-# 외부 시스템 호출 클라이언트 모듈.
-# hub 게이트웨이와 Gemini LLM 호출을 캡슐화하는 클라이언트를 정의한다.
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from pydantic import SecretStr
+
+if TYPE_CHECKING:
+    from google import genai as _genai_module  # noqa: F401
 
 
 class HubClient:
-    """장소·날씨·경로·룰 데이터를 hub로부터 조회하는 HTTP 클라이언트.
-
-    호출 단위로 timeout·retry·circuit-breaker를 적용하고, 응답을 agent 내부
-    스키마로 변환하여 노드 함수에 전달한다.
-    """
+    """장소·날씨·경로·룰 데이터를 hub로부터 조회하는 HTTP 클라이언트."""
     pass
 
 
@@ -16,4 +18,26 @@ class GeminiClient:
 
     프롬프트 구성·응답 파싱·토큰 사용량 제어(rate limit)를 담당한다.
     """
-    pass
+
+    def __init__(
+        self,
+        *,
+        api_key: SecretStr,
+        model: str,
+        client: "_genai_module.Client | None" = None,
+    ) -> None:
+        from google import genai
+
+        self._model = model
+        self._client = (
+            client
+            if client is not None
+            else genai.Client(api_key=api_key.get_secret_value())
+        )
+
+    async def generate_text(self, prompt: str) -> str:
+        response = await self._client.aio.models.generate_content(
+            model=self._model,
+            contents=prompt,
+        )
+        return response.text or ""
