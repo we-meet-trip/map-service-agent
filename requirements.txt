@@ -1,15 +1,42 @@
+# map-service-agent 의 런타임 의존성.
+# 각 패키지가 코드 어디에서 쓰이는지 한 줄로 정리한다.
+
+# fastapi
+#   - app/main.py 에서 `FastAPI(...)` 인스턴스, `@app.get("/health")`, `@app.post("/v1/recommend")` 라우터 정의에 사용.
 fastapi==0.136.1
+# uvicorn[standard]
+#   - Dockerfile ENTRYPOINT 의 ASGI 서버. app.main:app 을 호스팅한다.
 uvicorn[standard]==0.47.0
+# httpx[http2]
+#   - app/clients/agent_clients.py HubClient 가 `httpx.AsyncClient` 로 hub /v1/weather 를 호출.
+#   - app/nodes/agent_nodes.py fetch_weather 가 `httpx.HTTPStatusError` / `httpx.HTTPError` 를 분기.
 httpx[http2]==0.28.1
 
+# pydantic-settings
+#   - app/agent_settings.py 의 `AgentSettings(BaseSettings)` 환경 변수 로딩에 사용.
 pydantic-settings>=2.14.1,<3.0
 
+# langgraph
+#   - app/graph/agent_graph.py 의 `StateGraph`, `START`, `END` 그래프 빌더로 사용.
 langgraph==1.2.0
+# langchain-core
+#   - langgraph 가 내부적으로 요구하는 코어 타입/유틸 의존성.
 langchain-core==1.4.0
+# langgraph-checkpoint-postgres
+#   - 영속 체크포인터용. 현재 코드에서는 직접 import 하지 않지만 LangGraph 영속화 옵션을 위해 설치.
 langgraph-checkpoint-postgres==3.1.0
+# langsmith
+#   - LangGraph 실행 추적 SDK. 직접 import 없이 환경변수로 자동 연동된다.
 langsmith>=0.4.0,<1.0
 
+# psycopg[binary,pool]
+#   - langgraph-checkpoint-postgres 가 Postgres 연결에 사용하는 드라이버.
 psycopg[binary,pool]>=3.3.4,<4.0
+# redis
+#   - app/clients/agent_clients.py StreamsPublisher 가 `redis.asyncio` 로 XADD 발행.
 redis>=7.4.0,<8.0
 
+# google-genai
+#   - app/clients/agent_clients.py GeminiClient 가 `from google import genai`,
+#     `from google.genai import types as genai_types` 로 사용.
 google-genai==2.3.0
