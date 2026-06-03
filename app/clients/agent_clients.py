@@ -269,3 +269,12 @@ class GeminiClient:
         )
         body = resp.text or ""
         return response_schema.model_validate_json(body)
+
+    async def aclose(self) -> None:
+        """클라이언트 수명 종료 훅 — 인터페이스 일관성용 no-op.
+
+        HubClient/StreamsPublisher 와 동일한 `aclose()` 시그니처를 맞춰
+        호출측이 모든 클라이언트를 균일하게 정리할 수 있도록 한다.
+        google-genai `Client` 는 별도 명시적 종료가 필요 없어 no-op 이다.
+        """
+        return None

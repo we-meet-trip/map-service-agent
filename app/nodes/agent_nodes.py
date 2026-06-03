@@ -271,15 +271,10 @@ async def recommend_places(state: AgentState) -> AgentState:
         state["error"] = "recommend_places returned empty"
         return state
     # place_id 정규화: 0..N-1
+    # model_copy(update=...) 로 복사하므로 Place 에 필드가 추가돼도
+    # 자동 보존된다(수동 재구성 시 누락 위험 제거).
     normalized = [
-        Place(
-            place_id=i,
-            name=p.name,
-            address=p.address,
-            lat=p.lat,
-            lng=p.lng,
-            recommended_visit_time=p.recommended_visit_time,
-        )
+        p.model_copy(update={"place_id": i})
         for i, p in enumerate(envelope.places)
     ]
     state["places"] = normalized
@@ -324,7 +319,10 @@ async def recommend_route(state: AgentState) -> AgentState:
         return state
 
     valid_ids = {p.place_id for p in places}
-    if set(envelope.visit_order) != valid_ids:
+    if (
+        len(envelope.visit_order) != len(valid_ids)
+        or set(envelope.visit_order) != valid_ids
+    ):
         state["error"] = "visit_order must be a permutation of place ids"
         return state
     if len(envelope.legs) != max(len(places) - 1, 0):

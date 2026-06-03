@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     종료(`finally`):
       - 진행 중 백그라운드 태스크들을 `SHUTDOWN_GRACE_SECONDS` 동안 기다리고,
         시간 초과 시 미완료 태스크에 `cancel()` 을 보낸 뒤 다시 회수.
-      - HubClient/StreamsPublisher 의 `aclose()` 호출.
+      - HubClient/StreamsPublisher/GeminiClient 의 `aclose()` 호출(균일 정리).
       - `reset_all()` 로 모든 전역 슬롯을 None 으로 되돌린다.
     """
     settings = get_settings()
@@ -136,9 +136,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 for t in pending:
                     if not t.done():
                         t.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+                # cancel 후 회수에도 상한을 둔다. CancelledError 를
+                # 삼키는 태스크가 있어도 종료가 무한정 매달리지 않도록
+                # SHUTDOWN_GRACE_SECONDS 로 한 번 더 bound 한다.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=settings.SHUTDOWN_GRACE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "agent: cancelled task(s) did not settle within "
+                        "grace; abandoning"
+                    )
         await hub_client.aclose()
         await streams.aclose()
+        await gemini.aclose()
         reset_all()
         logger.info("agent: lifespan disposed")
 
