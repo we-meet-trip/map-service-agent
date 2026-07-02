@@ -126,6 +126,22 @@ class Place(BaseModel):
     lat: float = Field(ge=33.0, le=43.0)
     lng: float = Field(ge=124.0, le=132.0)
     recommended_visit_time: str
+    # 실측 출처(점 장소/코스)에서 채워지는 보강 필드. LLM 단독 생성
+    # 경로에서는 채워지지 않을 수 있어 모두 선택값이다.
+    content_id: Optional[str] = None
+    source: Optional[str] = None
+    category: Optional[str] = None
+    category_group_code: Optional[str] = None
+    phone: Optional[str] = None
+    place_url: Optional[str] = None
+    crs_dstnc_km: Optional[float] = None
+    crs_total_min: Optional[int] = None
+    crs_level: Optional[int] = None
+    brd_div: Optional[str] = None
+    gpx_url: Optional[str] = None
+    route_idx: Optional[str] = None
+    # 외부 실측 후보에 근거해 만든 장소면 True, LLM 단독 생성이면 False.
+    grounded: bool = True
 
 
 class Leg(BaseModel):
@@ -167,10 +183,34 @@ class PlacesEnvelope(BaseModel):
     places: 추천 장소 리스트.
 
     사용처:
-      - `GeminiClient.generate_structured(prompt, PlacesEnvelope)` 의
+      - 외부 실측 후보가 없을 때(grounding 불가)의 폴백 경로에서
+        `GeminiClient.generate_structured(prompt, PlacesEnvelope)` 의
         `response_schema` 로 전달되어 JSON → 모델 검증을 수행한다.
     """
     places: List[Place]
+
+
+class PlaceSelection(BaseModel):
+    """grounded 경로에서 LLM 이 고른 후보 1건.
+
+    index: 후보 목록에서 선택한 항목의 0 기반 인덱스.
+    recommended_visit_time: 해당 장소의 권장 방문 시간 텍스트.
+    """
+    index: int
+    recommended_visit_time: str
+
+
+class PlacesSelection(BaseModel):
+    """`recommend_places` 의 grounded 경로에서 LLM 이 돌려주는 선택 결과.
+
+    selections: 실측 후보 중에서 고른 항목들(방문 시간 포함). 장소의
+        이름·주소·좌표는 LLM 이 새로 만들지 않고 후보값을 그대로 쓴다.
+
+    사용처:
+      - `GeminiClient.generate_structured(prompt, PlacesSelection)` 의
+        `response_schema`.
+    """
+    selections: List[PlaceSelection]
 
 
 class RouteEnvelope(BaseModel):

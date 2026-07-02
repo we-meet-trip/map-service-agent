@@ -92,6 +92,41 @@ class HubClient:
         r.raise_for_status()
         return r.json()
 
+    async def search_places(
+        self,
+        province: str,
+        city: str,
+        *,
+        mobility: str | None = None,
+        keyword: str | None = None,
+        size: int = 15,
+    ) -> dict:
+        """hub `/v1/places` 를 호출해 실측 장소 후보를 받아 dict 로 반환.
+
+        인자(전부 GET query 로 전달):
+          province / city: 행정구역. 후보 조회의 기준 지역.
+          mobility: 이동수단. 코스 후보를 걷기/자전거로 거르는 데 쓰인다.
+          keyword: 검색어. 없으면 hub 가 행정구역명을 검색어로 쓴다.
+          size: 출처별 최대 후보 수.
+
+        실패 시:
+          - 4xx/5xx 응답이면 `raise_for_status()` 가 `httpx.HTTPStatusError`.
+          - 네트워크/타임아웃 류는 `httpx.HTTPError` 의 하위 예외.
+
+        반환: hub 응답 본문 dict. places/count/sources 키를 가진다.
+        호출처: `agent_nodes.search_places` 노드.
+        """
+        params: dict = {"province": province, "city": city, "size": size}
+        if mobility:
+            params["mobility"] = mobility
+        if keyword:
+            params["keyword"] = keyword
+        r = await self._client.get(
+            f"{self._base}/v1/places", params=params
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def aclose(self) -> None:
         """내부 `httpx.AsyncClient` 를 닫는다.
 

@@ -7,7 +7,7 @@
 
 파이프라인 (PoC 축약 — SoT §6.1 C1 흐름의 골격. hub /v1/places·/v1/rules/*
 호출과 score_and_rank/llm_reason 세분 노드는 운영단계 확장 대상):
-  parse_input -> fetch_weather -> recommend_places
+  parse_input -> fetch_weather -> search_places -> recommend_places
   -> recommend_route -> build_payload -> publish_done
 
 에러 라우팅 (`_route_after`):
@@ -31,6 +31,7 @@ from app.nodes.agent_nodes import (
     publish_done,
     recommend_places,
     recommend_route,
+    search_places,
 )
 
 
@@ -48,6 +49,7 @@ def build_graph():
     graph = StateGraph(AgentState)
     graph.add_node("parse_input", parse_input)
     graph.add_node("fetch_weather", fetch_weather)
+    graph.add_node("search_places", search_places)
     graph.add_node("recommend_places", recommend_places)
     graph.add_node("recommend_route", recommend_route)
     graph.add_node("build_payload", build_payload)
@@ -61,12 +63,15 @@ def build_graph():
     )
     graph.add_conditional_edges(
         "fetch_weather",
-        _route_after("recommend_places"),
+        _route_after("search_places"),
         {
-            "recommend_places": "recommend_places",
+            "search_places": "search_places",
             "build_payload": "build_payload",
         },
     )
+    # search_places 는 실패해도 error 를 세우지 않고 저하 표시로 폴백하므로
+    # 항상 recommend_places 로 진행한다.
+    graph.add_edge("search_places", "recommend_places")
     graph.add_conditional_edges(
         "recommend_places",
         _route_after("recommend_route"),
