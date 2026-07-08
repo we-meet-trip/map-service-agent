@@ -83,7 +83,9 @@ class _FakeGemini:
     def __init__(self, result):
         self._result = result
 
-    async def generate_structured(self, prompt, schema):
+    async def generate_structured(
+        self, prompt, schema, *, system_instruction=None
+    ):
         return self._result
 
 
@@ -95,6 +97,34 @@ def test_place_from_candidate_grounded():
     assert p.lat == pytest.approx(37.59)
     assert p.recommended_visit_time == "오전"
     assert p.gpx_url == "http://example/gpx"
+
+
+def test_place_from_candidate_normalizes_kakao_category():
+    """Kakao category 의 '>' 가 정규화되어 Place 생성이 성공한다.
+
+    이전에는 category "음식점 > 카페" 의 '>' 가 Place 검증기에 걸려
+    ValidationError → 후보 skip → grounded 추천 전멸이었다.
+    """
+    kakao = {
+        "content_id": "kakao:1891511991",
+        "source": "kakao",
+        "name": "우스블랑 청담점",
+        "address": "서울 강남구 청담동 44-14",
+        "lat": 37.5182,
+        "lng": 127.0454,
+        "category": "음식점 > 카페",
+        "category_group_code": "CE7",
+    }
+    p = _place_from_candidate(0, kakao, "오전 10시")
+    assert p.category == "음식점 / 카페"
+    assert p.name == "우스블랑 청담점"
+    assert p.grounded is True
+
+
+def test_place_from_candidate_normalizes_visit_time():
+    """방문시간(LLM 출력)에 꺾쇠가 있어도 정규화되어 통과한다."""
+    p = _place_from_candidate(0, _candidate(1), "9시 > 11시")
+    assert p.recommended_visit_time == "9시 / 11시"
 
 
 def test_search_places_degraded_on_error():

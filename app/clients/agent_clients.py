@@ -2,7 +2,8 @@
 
 hub HTTP, Redis Streams, Gemini LLM 3종을 캡슐화한다.
 
-  - `HubClient`         : hub 의 `/v1/weather` 를 호출해 날씨 데이터를 가져온다.
+  - `HubClient`         : hub 의 `/v1/weather`·`/v1/places`·`/v1/reviews`·
+                          `/v1/rules/*` 를 호출해 날씨·후보·리뷰·룰 결과를 가져온다.
   - `StreamsPublisher`  : Redis Streams 에 잡 완료/실패 페이로드를 XADD 발행한다.
   - `GeminiClient`      : Gemini 모델로 평문/구조화 응답을 생성한다.
 
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Type, TypeVar
 
 import httpx
@@ -29,8 +30,25 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
+class StructuredOutputError(ValueError):
+    """구조화 응답의 JSON 파싱/스키마 검증 실패.
+
+    ValueError 하위로 두어 기존 `except (ValidationError, ValueError)`
+    분기와 호환된다. 교정 재시도(`app/llm/structured_call.py`)가 모델에게
+    실패 원인을 피드백할 수 있도록 원문과 원인 예외를 보존한다.
+
+    raw_text: 모델이 돌려준 검증 실패 원문(빈 문자열일 수 있음).
+    cause: 원인 예외(pydantic ValidationError 등).
+    """
+
+    def __init__(self, message: str, *, raw_text: str, cause: Exception) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.cause = cause
+
+
 class HubClient:
-    """hub /v1/weather 호출 클라이언트.
+    """hub `/v1/weather`·`/v1/places`·`/v1/reviews`·`/v1/rules/*` 호출 클라이언트.
 
     내부에 `httpx.AsyncClient` 1개를 유지하며 lifespan 동안 재사용한다.
     HTTP 커넥션 풀과 keep-alive 이점을 누리도록 호출마다 새로 만들지 않는다.
@@ -127,6 +145,88 @@ class HubClient:
         r.raise_for_status()
         return r.json()
 
+    async def fetch_reviews(
+        self,
+        query: str,
+        *,
+        display: int = 3,
+    ) -> dict:
+        """hub `/v1/reviews` 를 호출해 블로그 리뷰 스니펫을 받아 dict 로 반환.
+
+        인자(전부 GET query 로 전달):
+          query: 검색어(장소명 등).
+          display: 최대 리뷰 수. 정렬은 `sort=sim`(정확도순) 고정.
+
+        실패 시:
+          - 4xx/5xx 응답이면 `raise_for_status()` 가 `httpx.HTTPStatusError`.
+          - 네트워크/타임아웃 류는 `httpx.HTTPError` 의 하위 예외.
+
+        반환: hub 응답 본문 dict. query/reviews/count 키를 가진다.
+        호출처: `agent_nodes._fetch_reviews_for` (리뷰 보강, best-effort).
+        """
+        params = {"query": query, "display": display, "sort": "sim"}
+        r = await self._client.get(
+            f"{self._base}/v1/reviews", params=params
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def filter_mobility_radius(
+        self,
+        origin: dict,
+        mobility: str,
+        candidates: list[dict],
+    ) -> dict:
+        """hub `POST /v1/rules/filter/mobility-radius` 로 반경 필터 결과를 받는다.
+
+        인자(전부 JSON body 로 전달):
+          origin: 후보 중심 좌표 `{"lat", "lng"}`.
+          mobility: 이동수단 문자열(walk/bicycle/car/transit).
+          candidates: 필터 대상 후보 dict 리스트(원본 그대로 전달).
+
+        실패 시:
+          - 4xx/5xx 응답이면 `raise_for_status()` 가 `httpx.HTTPStatusError`.
+          - 네트워크/타임아웃 류는 `httpx.HTTPError` 의 하위 예외.
+
+        반환: hub 응답 본문 dict. filtered/radius_m/dropped 키를 가진다.
+        호출처: `agent_nodes.rules_filter` 노드(예외는 저하로 흡수).
+        """
+        body = {
+            "origin": origin,
+            "mobility": mobility,
+            "candidates": candidates,
+        }
+        r = await self._client.post(
+            f"{self._base}/v1/rules/filter/mobility-radius", json=body
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def score_indoor_bonus(
+        self,
+        pois: list[dict],
+        day_pop_max: int,
+    ) -> dict:
+        """hub `POST /v1/rules/score/indoor-bonus` 로 실내 보너스 점수를 받는다.
+
+        인자(전부 JSON body 로 전달):
+          pois: 채점 대상 `{"content_id", "indoor_flag", "base_score"}` 리스트.
+          day_pop_max: 일정 구간의 일별 최대 강수확률(%). 실내 보너스 가중.
+
+        실패 시:
+          - 4xx/5xx 응답이면 `raise_for_status()` 가 `httpx.HTTPStatusError`.
+          - 네트워크/타임아웃 류는 `httpx.HTTPError` 의 하위 예외.
+
+        반환: hub 응답 본문 dict. scored(`{content_id, score}` 리스트) 키.
+        호출처: `agent_nodes.score_and_rank` 노드(예외는 저하로 흡수).
+        """
+        body = {"pois": pois, "day_pop_max": day_pop_max}
+        r = await self._client.post(
+            f"{self._base}/v1/rules/score/indoor-bonus", json=body
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def aclose(self) -> None:
         """내부 `httpx.AsyncClient` 를 닫는다.
 
@@ -206,6 +306,35 @@ class StreamsPublisher:
         )
         return message_id
 
+    async def publish_status(self, job_id: str, stage: str) -> str:
+        """노드 진행 이벤트 1건을 stream 에 발행한다 (SoT §4.5).
+
+        인자:
+          job_id: 잡 식별자.
+          stage: 진입한 노드 이름(parse_input, fetch_weather, ...).
+
+        메시지 필드: {job_id, stage, status:"in_progress", ts(UTC ISO8601)}.
+        본 메서드는 `agent:jobs:status` 용 인스턴스에서 호출하는 것을
+        전제로 하며, maxlen 정책은 생성자 인자를 그대로 따른다.
+
+        호출처: `agent_nodes._emit_stage` (모든 예외는 호출측이 삼킨다 —
+        진행 이벤트 실패가 잡을 죽여선 안 된다).
+        """
+        xadd_kwargs: dict = {}
+        if self._maxlen > 0:
+            xadd_kwargs["maxlen"] = self._maxlen
+            xadd_kwargs["approximate"] = True
+        return await self._client.xadd(
+            self._stream,
+            {
+                "job_id": job_id,
+                "stage": stage,
+                "status": "in_progress",
+                "ts": datetime.now(timezone.utc).isoformat(),
+            },
+            **xadd_kwargs,
+        )
+
     async def aclose(self) -> None:
         """내부 redis 클라이언트를 닫는다.
 
@@ -227,6 +356,16 @@ class GeminiClient:
         api_key: str,
         model: str,
         timeout: float = 60.0,
+        *,
+        temperature: float = 0.2,
+        max_output_tokens: int = 8192,
+        thinking_budget: int = 0,
+        retry_attempts: int = 1,
+        retry_initial_delay: float = 1.0,
+        retry_max_delay: float = 8.0,
+        retry_status_codes: str = "503,500",
+        http_timeout_seconds: float = 0.0,
+        limiter=None,
     ) -> None:
         """GeminiClient 초기화.
 
@@ -234,17 +373,72 @@ class GeminiClient:
         model: 호출에 사용할 모델 이름.
         timeout: 1회 호출 timeout(초). 본 값으로 모든 generate 호출이
                  `asyncio.wait_for` 에 감싸진다.
+        temperature: 생성 온도. 구조화 출력의 결정성을 위해 낮게 유지.
+        max_output_tokens: 응답 토큰 상한. Gemini 2.5 는 thinking 토큰이
+                           본 상한을 함께 소비하므로 과소 설정 시 JSON 이
+                           절단되어 검증 실패가 빈발한다. 여유 있게 둔다.
+        thinking_budget: Gemini 2.5 thinking 예산. 0=끔(구조화 추출 기본),
+                         양수=허용, 음수=ThinkingConfig 미설정(모델 기본).
+        retry_attempts: SDK 전송 재시도 총 시도 수(초기 호출 포함). 2 이상
+                        이면 http_status_codes 오류에 지수 백오프 재시도가
+                        적용된다. 1 이하이면 재시도를 구성하지 않는다.
+        retry_initial_delay / retry_max_delay: 지수 백오프 초기/상한(초).
+        retry_status_codes: 재시도 대상 HTTP 코드(쉼표 구분 문자열).
+                        "503,500" 처럼 명시한다. **429 제외**(RateLimiter
+                        이중 소진 방지). 빈 문자열/파싱 공집합이면 재시도
+                        비활성 — SDK 는 빈 리스트를 기본코드(429 포함)로
+                        되돌리므로 반드시 None 으로 변환해 넘긴다.
+        http_timeout_seconds: per-attempt HTTP 타임아웃(초). HttpOptions.
+                        timeout(ms) 로 전달. 0 이하이면 미설정.
+        limiter: `acquire()` 코루틴을 가진 rate limiter
+                 (`app/llm/rate_limit.GeminiRateLimiter`). None 이면
+                 rate-limit 없이 호출한다(단위 테스트 등).
 
         지연 import: `from google import genai` 를 메서드 호출 직전이 아닌
-        생성자에서 1회 import 해 client 인스턴스를 구성한다.
+        생성자에서 1회 import 해 client 인스턴스를 구성한다. 재시도/타임아웃
+        설정이 모두 비활성이면 http_options 를 넘기지 않아 기존 경로와
+        완전히 동일하게 동작한다.
 
         호출처: `app/main.py` lifespan.
         """
         from google import genai
+        from google.genai import types as genai_types
 
         self._model = model
         self._timeout = timeout
-        self._client = genai.Client(api_key=api_key)
+        self._temperature = temperature
+        self._max_output_tokens = max_output_tokens
+        self._thinking_budget = thinking_budget
+        self._limiter = limiter
+
+        # 재시도 대상 코드 파싱. 공집합이면 None(빈 리스트를 SDK 에 넘기면
+        # 기본코드(429 포함)로 되돌아가는 함정 회피).
+        codes = [
+            int(c) for c in retry_status_codes.split(",") if c.strip().isdigit()
+        ]
+        retry_options = None
+        if retry_attempts and retry_attempts > 1 and codes:
+            retry_options = genai_types.HttpRetryOptions(
+                attempts=retry_attempts,
+                initial_delay=retry_initial_delay,
+                max_delay=retry_max_delay,
+                http_status_codes=codes,
+            )
+        timeout_ms = (
+            int(http_timeout_seconds * 1000)
+            if http_timeout_seconds and http_timeout_seconds > 0
+            else None
+        )
+        # 둘 다 없으면 http_options 자체를 생략해 기존 경로를 보존한다.
+        if retry_options is not None or timeout_ms is not None:
+            http_options = genai_types.HttpOptions(
+                timeout=timeout_ms, retry_options=retry_options
+            )
+            self._client = genai.Client(
+                api_key=api_key, http_options=http_options
+            )
+        else:
+            self._client = genai.Client(api_key=api_key)
 
     async def generate_text(self, prompt: str) -> str:
         """평문 텍스트 응답을 받아 문자열로 돌려준다.
@@ -266,44 +460,80 @@ class GeminiClient:
         return resp.text or ""
 
     async def generate_structured(
-        self, prompt: str, response_schema: Type[T]
+        self,
+        prompt: str,
+        response_schema: Type[T],
+        *,
+        system_instruction: str | None = None,
     ) -> T:
         """구조화(JSON) 응답을 Pydantic 모델로 검증해서 돌려준다.
 
-        prompt: 입력 프롬프트.
+        prompt: 입력 프롬프트(데이터 태그로 격리된 user 콘텐츠).
         response_schema: 응답 스키마로 사용할 Pydantic 모델 클래스(예:
                          `PlacesEnvelope`, `RouteEnvelope`).
+        system_instruction: 불변 규칙(역할·인젝션 방어·스키마 준수)을
+                            담는 시스템 지시. 사용자 유래 문자열을 절대
+                            섞지 않는다(프롬프트 인젝션 방어의 1층).
 
         동작:
+          - limiter 가 있으면 호출 직전 `await limiter.acquire()` 로
+            token-bucket/일일 카운터를 소비한다(SoT §10.2).
           - GenerateContentConfig 에 `response_mime_type="application/json"`,
-            `response_schema=response_schema` 를 설정해 모델에게 JSON 출력을
-            지시한다.
+            `response_schema=response_schema`, `system_instruction`,
+            `temperature`, `max_output_tokens` 를 설정해 JSON 출력을 강제.
           - 응답 text(없으면 빈 문자열) 를
             `response_schema.model_validate_json(body)` 로 파싱·검증해 반환.
+            SDK 의 `resp.parsed` 는 실패 시 None 이 될 수 있어, 원문 재검증을
+            단일 최종 방어선으로 유지한다.
 
         실패:
           - 타임아웃: `asyncio.TimeoutError`.
-          - JSON 파싱 또는 스키마 검증 실패: pydantic `ValidationError`
-            또는 `ValueError`. `recommend_places` 노드는 본 두 예외를
-            잡아 1회 재시도한다.
+          - rate-limit: limiter 가 던지는 `GeminiQuotaError`.
+          - JSON 파싱/스키마 검증 실패: `StructuredOutputError`
+            (ValueError 하위, 원문·원인 보존 — 교정 재시도용).
 
-        호출처: `agent_nodes.recommend_places`, `agent_nodes.recommend_route`.
+        호출처: `app/llm/structured_call.call_structured` (예산·교정 재시도
+        계층). 노드가 직접 호출하지 않는다.
         """
         from google.genai import types as genai_types
+        from pydantic import ValidationError
+
+        if self._limiter is not None:
+            await self._limiter.acquire()
+
+        # Gemini 2.5 thinking 토큰은 max_output_tokens 를 함께 소비한다.
+        # 구조화 JSON 추출에는 thinking 이 불필요하고, 켜두면 출력 공간을
+        # 잠식해 JSON 절단(EOF ValidationError)을 유발한다(E2E 실측).
+        # budget 음수면 미설정(모델 기본)으로 둔다.
+        config_kwargs = dict(
+            response_mime_type="application/json",
+            response_schema=response_schema,
+            system_instruction=system_instruction,
+            temperature=self._temperature,
+            max_output_tokens=self._max_output_tokens,
+        )
+        if self._thinking_budget >= 0:
+            config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_budget=self._thinking_budget
+            )
 
         resp = await asyncio.wait_for(
             self._client.aio.models.generate_content(
                 model=self._model,
                 contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=response_schema,
-                ),
+                config=genai_types.GenerateContentConfig(**config_kwargs),
             ),
             timeout=self._timeout,
         )
         body = resp.text or ""
-        return response_schema.model_validate_json(body)
+        try:
+            return response_schema.model_validate_json(body)
+        except (ValidationError, ValueError) as e:
+            raise StructuredOutputError(
+                f"structured output validation failed: {type(e).__name__}",
+                raw_text=body,
+                cause=e,
+            ) from e
 
     async def aclose(self) -> None:
         """클라이언트 수명 종료 훅 — 인터페이스 일관성용 no-op.

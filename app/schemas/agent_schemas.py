@@ -14,11 +14,35 @@
 """
 from __future__ import annotations
 
+import re
 from datetime import date, time
 from enum import Enum
-from typing import List, Literal, Optional
+from typing import Annotated, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# LLM 생성 텍스트 필드에서 거부하는 문자: 태그 문자(<, >)와 제어문자.
+# 프롬프트 인젝션 산출물이 페이로드를 타고 하류(클라이언트 렌더링,
+# 후속 프롬프트)로 흘러가는 것을 차단하는 최종 방어선이다.
+# 검증 실패는 ValidationError → StructuredOutputError → 교정 재시도로
+# 자연 연결된다. 주의: google-genai 가 Field 제약(max_length 등)을
+# response_schema 로 전달하지 못할 수 있으므로, 본 클라이언트측 pydantic
+# 검증이 실질적 최종 방어선이다.
+_FORBIDDEN_TEXT_RE = re.compile(
+    "[<>＜＞"                              # 꺾쇠(ASCII+전각)
+    "\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f"          # C0/C1 제어문자
+    "​-‏  ‪-‮⁦-⁩"  # zw/bidi
+    "⁠-⁤﻿"                          # word joiner·BOM
+    "\U000e0000-\U000e007f"                        # Unicode Tags 블록
+    "]"
+)
+
+
+def _reject_tags_and_control(value):
+    """텍스트 필드에 태그/제어문자가 있으면 ValueError (None 은 통과)."""
+    if isinstance(value, str) and _FORBIDDEN_TEXT_RE.search(value):
+        raise ValueError("text contains forbidden tag or control characters")
+    return value
 
 
 class Mobility(str, Enum):
@@ -71,6 +95,15 @@ class AgentRequest(BaseModel):
     mobility: 선호 이동 수단(`Mobility`). 없을 수 있음.
     province: 광역 행정구역(예: "서울특별시"). 1~20자.
     city: 시/군/구(예: "강남구"). 1~20자.
+    schedule_id: user-BFF 의 일정 식별자(SoT §6.1 B2 body). 추적/영속화
+                 연계용 패스스루 — agent 는 user_service 스키마를 읽지
+                 않으므로 이 값으로 조회하지 않는다. nullable.
+    stage: 추천 단계. "init"(초기 추천) 또는 "mode1"(재탐색, SoT §6.2).
+           기본 "init" — 기존 호출자 하위호환.
+    exclude: Mode 1 재탐색 시 재추천을 금지할 content_id 목록
+             (SoT §6.2 exclude_list). grounded 후보 필터에 사용된다.
+             invent(LLM 생성) 폴백에는 content_id 가 없어 적용 불가 —
+             한계는 search_places docstring 참조.
 
     호출 흐름:
       클라이언트 → `app.main.recommend(req)` → `_run_job` →
@@ -83,6 +116,17 @@ class AgentRequest(BaseModel):
     mobility: Optional[Mobility] = None
     province: str = Field(min_length=1, max_length=20)
     city: str = Field(min_length=1, max_length=20)
+    schedule_id: Optional[str] = Field(default=None, max_length=64)
+    stage: Literal["init", "mode1"] = "init"
+    exclude: Optional[
+        List[Annotated[str, Field(min_length=1, max_length=64)]]
+    ] = Field(default=None, max_length=50)
+
+    @field_validator("stage", mode="before")
+    @classmethod
+    def _default_stage_when_null(cls, value):
+        """JSON `"stage": null`(Jackson null 직렬화)을 "init" 으로 보정."""
+        return "init" if value is None else value
 
 
 class AgentJobAccepted(BaseModel):
@@ -121,11 +165,22 @@ class Place(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     place_id: int
-    name: str
-    address: str
+    name: str = Field(min_length=1, max_length=80)
+    address: str = Field(max_length=200)
     lat: float = Field(ge=33.0, le=43.0)
     lng: float = Field(ge=124.0, le=132.0)
-    recommended_visit_time: str
+    recommended_visit_time: str = Field(max_length=50)
+
+    # 하류(클라이언트 렌더링·후속 프롬프트)로 나가는 모든 텍스트 필드에
+    # 적용한다 — invent 경로에선 LLM 이, grounded 경로에선 외부
+    # API(TourAPI/Kakao/Naver) 값이 채우는 필드 전부가 대상(간접 인젝션·
+    # 표시 스푸핑 차단). grounded 후보가 검증에 걸리는 극단 케이스는
+    # Place 생성 실패로 해당 후보만 건너뛴다(호출측 skip 규칙).
+    _no_tags = field_validator(
+        "name", "address", "recommended_visit_time",
+        "content_id", "source", "category", "category_group_code",
+        "phone", "place_url", "brd_div", "gpx_url", "route_idx",
+    )(_reject_tags_and_control)
     # 실측 출처(점 장소/코스)에서 채워지는 보강 필드. LLM 단독 생성
     # 경로에서는 채워지지 않을 수 있어 모두 선택값이다.
     content_id: Optional[str] = None
@@ -142,6 +197,12 @@ class Place(BaseModel):
     route_idx: Optional[str] = None
     # 외부 실측 후보에 근거해 만든 장소면 True, LLM 단독 생성이면 False.
     grounded: bool = True
+    # llm_reason 노드가 병합하는 장소별 추천 이유(SoT §3 agent 책임).
+    # LLM 응답(ReasonEnvelope)에서 검증을 거친 값만 들어온다. 생성
+    # 시점에는 없다가 build_payload 에서 model_copy 로 채워진다.
+    reason: Optional[str] = Field(default=None, max_length=200)
+
+    _no_tags_reason = field_validator("reason")(_reject_tags_and_control)
 
 
 class Leg(BaseModel):
@@ -196,8 +257,12 @@ class PlaceSelection(BaseModel):
     index: 후보 목록에서 선택한 항목의 0 기반 인덱스.
     recommended_visit_time: 해당 장소의 권장 방문 시간 텍스트.
     """
-    index: int
-    recommended_visit_time: str
+    index: int = Field(ge=0)
+    recommended_visit_time: str = Field(max_length=50)
+
+    _no_tags = field_validator("recommended_visit_time")(
+        _reject_tags_and_control
+    )
 
 
 class PlacesSelection(BaseModel):
@@ -211,6 +276,35 @@ class PlacesSelection(BaseModel):
         `response_schema`.
     """
     selections: List[PlaceSelection]
+
+
+class PlaceReason(BaseModel):
+    """`llm_reason` 응답의 장소별 추천 이유 1건.
+
+    place_id: 대상 장소의 place_id. `llm_reason` 노드가 유효 id 집합
+              부분집합·무중복을 semantic 검증한다.
+    reason: 추천 이유 텍스트(≤200자, 태그/제어문자 금지).
+    """
+    place_id: int
+    reason: str = Field(min_length=1, max_length=200)
+
+    _no_tags = field_validator("reason")(_reject_tags_and_control)
+
+
+class ReasonEnvelope(BaseModel):
+    """`llm_reason` 단계에서 LLM 이 돌려주는 구조화 응답의 루트.
+
+    reasons: 장소별 추천 이유 리스트(모든 place_id 각 1건이 목표).
+    clothing: 날씨 기반 옷차림 안내 전역 1건(≤300자).
+
+    사용처:
+      - `GeminiClient.generate_structured(prompt, ReasonEnvelope)` 의
+        `response_schema` (llm_reason 노드, LLM 3번째 호출).
+    """
+    reasons: List[PlaceReason]
+    clothing: str = Field(min_length=1, max_length=300)
+
+    _no_tags = field_validator("clothing")(_reject_tags_and_control)
 
 
 class RouteEnvelope(BaseModel):
@@ -233,9 +327,11 @@ class JobDonePayload(BaseModel):
 
     job_id: 어떤 잡의 결과인지 식별.
     status: Literal["done", "failed"]. 둘 중 하나만 허용.
-    places: 성공 시 추천 장소 리스트. 실패 시 None.
+    places: 성공 시 추천 장소 리스트(장소별 reason 포함 가능). 실패 시 None.
     visit_order: 성공 시 방문 순서. 실패 시 None.
     legs: 성공 시 동선 구간 리스트. 실패 시 None.
+    clothing: 성공 시 날씨 기반 옷차림 안내(llm_reason 산출). llm_reason
+              이 degrade 로 생략되면 None 일 수 있다.
     error: 실패 시 사유 텍스트. 성공 시 None.
 
     직렬화:
@@ -252,4 +348,5 @@ class JobDonePayload(BaseModel):
     places: Optional[List[Place]] = None
     visit_order: Optional[List[int]] = None
     legs: Optional[List[Leg]] = None
+    clothing: Optional[str] = None
     error: Optional[str] = None
