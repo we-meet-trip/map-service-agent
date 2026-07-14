@@ -33,6 +33,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Header, HTTPException
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.agent_dependencies import (
     get_streams_publisher,
@@ -273,6 +274,11 @@ app = FastAPI(
     title="map-service-agent",
     version="0.0.1-poc",
     lifespan=lifespan,
+)
+
+# Prometheus 계측 → GET /metrics (인증 없음, map-net 내부 Prometheus 스크레이프).
+Instrumentator().instrument(app).expose(
+    app, endpoint="/metrics", include_in_schema=False
 )
 
 
