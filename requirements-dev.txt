@@ -1,0 +1,10 @@
+# map-service-agent 의 개발·테스트 전용 의존성.
+# 런타임 이미지에는 설치하지 않는다: pip install -r requirements.txt -r requirements-dev.txt
+
+# pytest
+#   - tests/ 전체 실행 러너.
+pytest>=8.0,<9.0
+# pytest-asyncio
+#   - async 테스트 함수 실행(현행 테스트는 asyncio.run 사용이나, 신규 테스트의
+#     async fixture/함수 지원을 위해 고정).
+pytest-asyncio>=0.26,<2.0

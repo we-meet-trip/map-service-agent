@@ -26,6 +26,7 @@ from app.clients.agent_clients import (
 # 초기값 None 은 "아직 주입되지 않음" 을 의미한다.
 _hub_client: HubClient | None = None
 _streams: StreamsPublisher | None = None
+_status_streams: StreamsPublisher | None = None
 _gemini: GeminiClient | None = None
 
 
@@ -71,6 +72,28 @@ def get_streams_publisher() -> StreamsPublisher:
     return _streams
 
 
+def set_status_publisher(publisher: StreamsPublisher) -> None:
+    """status 스트림(agent:jobs:status) 발행자를 전역 슬롯에 주입.
+
+    호출처: `app/main.py` lifespan(부팅 단계).
+    """
+    global _status_streams
+    _status_streams = publisher
+
+
+def get_status_publisher() -> StreamsPublisher:
+    """전역 슬롯에서 status 발행자를 꺼낸다.
+
+    슬롯이 비어 있으면 `RuntimeError("StatusPublisher is not initialized")`.
+    호출처: `app/nodes/agent_nodes.py` 의 `_emit_stage` — 예외는 호출측이
+    삼키므로(진행 이벤트는 best-effort), 미주입 환경(단위 테스트)에서도
+    잡 실행이 깨지지 않는다.
+    """
+    if _status_streams is None:
+        raise RuntimeError("StatusPublisher is not initialized")
+    return _status_streams
+
+
 def set_gemini_client(client: GeminiClient) -> None:
     """GeminiClient 인스턴스를 전역 슬롯에 주입.
 
@@ -97,7 +120,8 @@ def reset_all() -> None:
 
     호출처: `app/main.py` lifespan 의 종료 finally 블록.
     """
-    global _hub_client, _streams, _gemini
+    global _hub_client, _streams, _status_streams, _gemini
     _hub_client = None
     _streams = None
+    _status_streams = None
     _gemini = None

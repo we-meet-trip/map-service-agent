@@ -7,6 +7,9 @@ fastapi==0.136.1
 # uvicorn[standard]
 #   - Dockerfile ENTRYPOINT 의 ASGI 서버. app.main:app 을 호스팅한다.
 uvicorn[standard]==0.47.0
+# prometheus-fastapi-instrumentator
+#   - app/main.py 에서 GET /metrics 노출. 모니터링 스택이 스크레이프.
+prometheus-fastapi-instrumentator>=7.0,<8.0
 # httpx[http2]
 #   - app/clients/agent_clients.py HubClient 가 `httpx.AsyncClient` 로 hub /v1/weather 를 호출.
 #   - app/nodes/agent_nodes.py fetch_weather 가 `httpx.HTTPStatusError` / `httpx.HTTPError` 를 분기.

@@ -26,18 +26,21 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.agent_dependencies import (
     get_streams_publisher,
     reset_all,
     set_gemini_client,
     set_hub_client,
+    set_status_publisher,
     set_streams_publisher,
 )
 from app.agent_settings import get_settings
@@ -47,6 +50,7 @@ from app.clients.agent_clients import (
     StreamsPublisher,
 )
 from app.graph.agent_graph import build_graph
+from app.llm.rate_limit import GeminiRateLimiter
 from app.schemas.agent_schemas import (
     AgentJobAccepted,
     AgentRequest,
@@ -65,6 +69,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         `RuntimeError("GEMINI_API_KEY is required")` 로 즉시 실패.
       - `INTERNAL_SERVICE_TOKEN` 이 설정되어 있으면 그 SecretStr 평문 값을
         HubClient 의 `X-Internal-Token` 헤더로 전달한다(없으면 None).
+      - `AUTH_ENFORCED=true` 인데 토큰이 비어 있으면
+        `RuntimeError("AUTH_ENFORCED=true requires INTERNAL_SERVICE_TOKEN")`
+        로 부팅 중단(fail-fast). false(기본)면 토큰 미설정을 허용한다.
       - HubClient, StreamsPublisher, GeminiClient 를 만들어 모듈 전역 슬롯
         (`set_hub_client` / `set_streams_publisher` / `set_gemini_client`) 에
         주입한다. LangGraph 노드들은 함수 내부 import 와 getter 로 본 슬롯을
@@ -83,11 +90,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not settings.GEMINI_API_KEY.get_secret_value():
         raise RuntimeError("GEMINI_API_KEY is required")
 
+    # INTERNAL_SERVICE_TOKEN 은 SecretStr | None — 평문을 1회만 꺼내
+    # 아래 부팅 게이트와 HubClient 헤더에 공유한다.
     token = (
         settings.INTERNAL_SERVICE_TOKEN.get_secret_value()
         if settings.INTERNAL_SERVICE_TOKEN
         else None
     )
+    # AUTH_ENFORCED=true 배포에서는 토큰 부재 시 부팅을 중단한다
+    # (fail-fast — GEMINI_API_KEY 부재와 동일 패턴). false(기본)면
+    # `_verify_internal_token` 이 토큰 미설정 시 경고 로그와 함께 검증을
+    # 생략하는 기존 동작을 유지한다.
+    if settings.AUTH_ENFORCED and not token:
+        raise RuntimeError(
+            "AUTH_ENFORCED=true requires INTERNAL_SERVICE_TOKEN"
+        )
     hub_client = HubClient(
         base_url=settings.HUB_BASE_URL,
         token=token,
@@ -99,15 +116,108 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stream=settings.STREAM_NAME,
         maxlen=settings.STREAM_MAXLEN,
     )
+    # 진행 이벤트(agent:jobs:status, SoT §4.5) 전용 발행자. done 스트림과
+    # 동일 DB 에 둔다. 소비자는 후속 주차(user-BFF progress) — 발행만 한다.
+    status_streams = StreamsPublisher(
+        redis_url=settings.REDIS_URL,
+        db=settings.REDIS_DB_STREAMS,
+        stream=settings.STATUS_STREAM_NAME,
+        maxlen=settings.STATUS_STREAM_MAXLEN,
+    )
+    # Gemini 호출 한도 집행기(SoT §10.2·R-01). GeminiClient 가 generate
+    # 직전 acquire() 로 소비하며, RPM/RPD 초과 시 GeminiQuotaError 로
+    # 잡이 실패 페이로드(gemini_rpm_exceeded / gemini_rpd_exceeded)를 낸다.
+    limiter = GeminiRateLimiter(
+        redis_url=settings.REDIS_URL,
+        db=settings.REDIS_DB_RATELIMIT,
+        capacity=settings.GEMINI_RPM_LIMIT,
+        refill_per_min=settings.GEMINI_RPM_LIMIT,
+        daily_cap=settings.GEMINI_RPD_CAP,
+    )
     gemini = GeminiClient(
         api_key=settings.GEMINI_API_KEY.get_secret_value(),
         model=settings.GEMINI_MODEL,
         timeout=settings.GEMINI_TIMEOUT_SECONDS,
+        temperature=settings.GEMINI_TEMPERATURE,
+        max_output_tokens=settings.GEMINI_MAX_OUTPUT_TOKENS,
+        thinking_budget=settings.GEMINI_THINKING_BUDGET,
+        retry_attempts=settings.GEMINI_RETRY_ATTEMPTS,
+        retry_initial_delay=settings.GEMINI_RETRY_INITIAL_DELAY,
+        retry_max_delay=settings.GEMINI_RETRY_MAX_DELAY,
+        retry_status_codes=settings.GEMINI_RETRY_STATUS_CODES,
+        http_timeout_seconds=settings.GEMINI_HTTP_TIMEOUT_SECONDS,
+        limiter=limiter,
     )
     set_hub_client(hub_client)
     set_streams_publisher(streams)
+    set_status_publisher(status_streams)
     set_gemini_client(gemini)
-    app.state.graph = build_graph()
+
+    # LangGraph Postgres 체크포인터 (SoT B5, schema=langgraph).
+    # CHECKPOINT_ENABLED=true 인데 연결/스키마 준비가 실패하면 부팅을
+    # 중단한다(fail-fast — GEMINI_API_KEY 부재와 동일 패턴, 사용자 결정
+    # 2026-07-05). 관련 모듈은 지연 import 한다 — 로컬 단위 테스트
+    # 환경에는 psycopg/checkpoint-postgres 가 없을 수 있고, 테스트는
+    # checkpointer=None 경로만 사용한다.
+    checkpointer = None
+    checkpoint_pool = None
+    if settings.CHECKPOINT_ENABLED:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        from psycopg.rows import dict_row
+        from psycopg_pool import AsyncConnectionPool
+
+        schema = settings.LANGGRAPH_SCHEMA
+        if not schema.isidentifier():
+            raise RuntimeError(
+                f"invalid LANGGRAPH_SCHEMA identifier: {schema!r}"
+            )
+        conninfo = (
+            f"postgresql://{settings.POSTGRES_USER}:"
+            f"{settings.POSTGRES_PASSWORD.get_secret_value()}"
+            f"@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}"
+            f"/{settings.POSTGRES_DB}"
+        )
+        try:
+            # search_path 를 langgraph 스키마로 고정해 setup() 이 public
+            # 에 테이블을 만들지 않도록 한다(AsyncPostgresSaver 는 스키마
+            # 인자를 직접 받지 않는다 — conninfo options 로 지정).
+            checkpoint_pool = AsyncConnectionPool(
+                conninfo,
+                open=False,
+                kwargs={
+                    "autocommit": True,
+                    "prepare_threshold": 0,
+                    "row_factory": dict_row,
+                    "options": f"-c search_path={schema}",
+                },
+            )
+            await checkpoint_pool.open()
+            async with checkpoint_pool.connection() as conn:
+                await conn.execute(
+                    f"CREATE SCHEMA IF NOT EXISTS {schema}"
+                )
+            checkpointer = AsyncPostgresSaver(checkpoint_pool)
+            await checkpointer.setup()
+            logger.info(
+                "agent: langgraph checkpointer ready schema=%s", schema
+            )
+        except Exception as e:
+            # fail-fast 경로에서도 이미 생성한 클라이언트들을 대칭적으로
+            # 정리한다 — finally 블록은 yield 이전 raise 로 도달 불가.
+            if checkpoint_pool is not None:
+                await checkpoint_pool.close()
+            await hub_client.aclose()
+            await streams.aclose()
+            await status_streams.aclose()
+            await gemini.aclose()
+            await limiter.aclose()
+            reset_all()
+            raise RuntimeError(
+                "langgraph checkpointer init failed (set "
+                "CHECKPOINT_ENABLED=false to boot without it)"
+            ) from e
+
+    app.state.graph = build_graph(checkpointer=checkpointer)
     app.state.bg_tasks: set[asyncio.Task] = set()
     app.state.job_timeout_seconds = settings.JOB_TIMEOUT_SECONDS
     logger.info(
@@ -151,7 +261,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     )
         await hub_client.aclose()
         await streams.aclose()
+        await status_streams.aclose()
         await gemini.aclose()
+        await limiter.aclose()
+        if checkpoint_pool is not None:
+            await checkpoint_pool.close()
         reset_all()
         logger.info("agent: lifespan disposed")
 
@@ -161,6 +275,41 @@ app = FastAPI(
     version="0.0.1-poc",
     lifespan=lifespan,
 )
+
+# Prometheus 계측 → GET /metrics (인증 없음, map-net 내부 Prometheus 스크레이프).
+Instrumentator().instrument(app).expose(
+    app, endpoint="/metrics", include_in_schema=False
+)
+
+
+def _verify_internal_token(provided: str | None) -> None:
+    """B2 인바운드 요청의 `X-Internal-Token` 을 검증한다 (SoT §5.5).
+
+    - `INTERNAL_SERVICE_TOKEN` 이 설정된 경우: 헤더 부재 또는 불일치 시
+      401. 비교는 `hmac.compare_digest` 로 상수 시간 수행.
+    - 미설정(PoC 로컬 등): 검증을 생략하되 경고 로그를 남긴다 — 잡 1건이
+      Gemini 유료 호출을 유발하므로 미인증 노출은 비용 유발 DoS 표면이다.
+
+    호출처: `recommend` 엔드포인트 진입부.
+    """
+    settings = get_settings()
+    expected = (
+        settings.INTERNAL_SERVICE_TOKEN.get_secret_value()
+        if settings.INTERNAL_SERVICE_TOKEN
+        else ""
+    )
+    if not expected:
+        logger.warning(
+            "INTERNAL_SERVICE_TOKEN not set - /v1/recommend accepts "
+            "unauthenticated requests"
+        )
+        return
+    # bytes 비교: str 비교는 비-ASCII 입력(공격자 제어 헤더)에서
+    # compare_digest 가 TypeError 를 던져 401 대신 500 이 된다.
+    if provided is None or not hmac.compare_digest(
+        provided.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="invalid internal token")
 
 
 @app.get("/health")
@@ -219,8 +368,11 @@ async def _run_job(
       timeout_seconds: 잡 1건당 허용 시간(`lifespan` 에서 settings.JOB_TIMEOUT_SECONDS).
 
     동작:
-      `graph.ainvoke({"job_id": job_id, "request": req})` 를
-      `asyncio.wait_for(...)` 로 감싸 강제 종료한다.
+      `graph.ainvoke({"job_id": job_id, "request": req},
+      config={"configurable": {"thread_id": job_id}})` 를
+      `asyncio.wait_for(...)` 로 감싸 강제 종료한다. thread_id 는
+      체크포인터의 스레드 식별자다(체크포인터 없이 컴파일된 그래프에도
+      무해하다).
 
     오류 처리(모두 `_publish_failure` 로 실패 페이로드 발행):
       - `asyncio.TimeoutError`: "job timeout after N seconds".
@@ -231,7 +383,10 @@ async def _run_job(
     """
     try:
         await asyncio.wait_for(
-            graph.ainvoke({"job_id": job_id, "request": req}),
+            graph.ainvoke(
+                {"job_id": job_id, "request": req},
+                config={"configurable": {"thread_id": job_id}},
+            ),
             timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
@@ -257,13 +412,21 @@ async def _run_job(
     response_model=AgentJobAccepted,
     status_code=202,
 )
-async def recommend(req: AgentRequest) -> AgentJobAccepted:
+async def recommend(
+    req: AgentRequest,
+    x_internal_token: str | None = Header(
+        default=None, alias="X-Internal-Token"
+    ),
+) -> AgentJobAccepted:
     """추천 잡을 비동기 등록하고 즉시 202 로 응답.
 
     인자:
       req: 요청 본문. `AgentRequest` 스키마.
+      x_internal_token: B2 내부 서비스 인증 헤더(SoT §5.5). 토큰이
+        설정된 배포에서 부재/불일치면 401.
 
     동작:
+      - `_verify_internal_token` 으로 인바운드 인증을 먼저 검증.
       - `app.state.graph` 가 준비되지 않았으면 503 "graph not ready".
       - `uuid.uuid4()` 로 `job_id` 생성.
       - `asyncio.create_task(_run_job(...))` 로 백그라운드 잡 등록.
@@ -273,6 +436,7 @@ async def recommend(req: AgentRequest) -> AgentJobAccepted:
       - 클라이언트에는 `AgentJobAccepted(job_id=...)` 즉시 반환(status_code=202).
         실제 결과는 Redis Streams `agent:jobs:done` 으로 비동기 게시된다.
     """
+    _verify_internal_token(x_internal_token)
     if not hasattr(app.state, "graph"):
         raise HTTPException(
             status_code=503, detail="graph not ready"
