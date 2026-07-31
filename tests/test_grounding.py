@@ -91,7 +91,7 @@ class _FakeGemini:
 
 def test_place_from_candidate_grounded():
     """후보 dict 가 grounded Place 로 변환된다."""
-    p = _place_from_candidate(0, _candidate(1), "오전")
+    p = _place_from_candidate(0, _candidate(1), "오전", 1)
     assert p.grounded is True
     assert p.source == "durunubi"
     assert p.lat == pytest.approx(37.59)
@@ -115,7 +115,7 @@ def test_place_from_candidate_normalizes_kakao_category():
         "category": "음식점 > 카페",
         "category_group_code": "CE7",
     }
-    p = _place_from_candidate(0, kakao, "오전 10시")
+    p = _place_from_candidate(0, kakao, "오전 10시", 1)
     assert p.category == "음식점 / 카페"
     assert p.name == "우스블랑 청담점"
     assert p.grounded is True
@@ -123,7 +123,7 @@ def test_place_from_candidate_normalizes_kakao_category():
 
 def test_place_from_candidate_normalizes_visit_time():
     """방문시간(LLM 출력)에 꺾쇠가 있어도 정규화되어 통과한다."""
-    p = _place_from_candidate(0, _candidate(1), "9시 > 11시")
+    p = _place_from_candidate(0, _candidate(1), "9시 > 11시", 1)
     assert p.recommended_visit_time == "9시 / 11시"
 
 
@@ -162,10 +162,10 @@ def test_recommend_places_grounded_selection():
     candidates = [_candidate(i) for i in range(3)]
     selection = PlacesSelection(
         selections=[
-            PlaceSelection(index=2, recommended_visit_time="오전"),
-            PlaceSelection(index=0, recommended_visit_time="오후"),
-            PlaceSelection(index=99, recommended_visit_time="범위밖"),
-            PlaceSelection(index=2, recommended_visit_time="중복"),
+            PlaceSelection(index=2, day=1, recommended_visit_time="오전"),
+            PlaceSelection(index=0, day=1, recommended_visit_time="오후"),
+            PlaceSelection(index=99, day=1, recommended_visit_time="범위밖"),
+            PlaceSelection(index=2, day=1, recommended_visit_time="중복"),
         ]
     )
     deps.set_gemini_client(_FakeGemini(selection))
@@ -192,6 +192,7 @@ def test_recommend_places_fallback_invent():
         places=[
             Place(
                 place_id=5,
+                day=1,
                 name="가짜",
                 address="addr",
                 lat=37.5,
@@ -243,9 +244,9 @@ def test_select_places_skips_bad_coord_candidate():
                   _candidate(2)]
     selection = PlacesSelection(
         selections=[
-            PlaceSelection(index=0, recommended_visit_time="t0"),
-            PlaceSelection(index=1, recommended_visit_time="t1"),
-            PlaceSelection(index=2, recommended_visit_time="t2"),
+            PlaceSelection(index=0, day=1, recommended_visit_time="t0"),
+            PlaceSelection(index=1, day=1, recommended_visit_time="t1"),
+            PlaceSelection(index=2, day=1, recommended_visit_time="t2"),
         ]
     )
     deps.set_gemini_client(_FakeGemini(selection))

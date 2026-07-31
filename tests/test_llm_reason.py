@@ -33,6 +33,7 @@ def _places(n: int = 2) -> list[Place]:
     return [
         Place(
             place_id=i,
+            day=1,
             name=f"장소{i}",
             address="주소",
             lat=37.5,

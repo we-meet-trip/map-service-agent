@@ -117,7 +117,7 @@ def _invoke(req: AgentRequest, hub, gemini) -> tuple[dict, _CapturePublisher]:
 def _selection(n: int) -> PlacesSelection:
     return PlacesSelection(
         selections=[
-            PlaceSelection(index=i, recommended_visit_time="오전")
+            PlaceSelection(index=i, day=1, recommended_visit_time="오전")
             for i in range(n)
         ]
     )

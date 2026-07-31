@@ -90,6 +90,7 @@ def test_route_prompt_view_is_slim_and_bounded() -> None:
     places = [
         Place(
             place_id=0,
+            day=1,
             name="장" * 80,  # 스키마 상한(80)까지 채운 이름
             address="a",
             lat=37.5,
@@ -98,6 +99,7 @@ def test_route_prompt_view_is_slim_and_bounded() -> None:
         ),
         Place(
             place_id=1,
+            day=1,
             name="정상장소",
             address="b",
             lat=37.6,
@@ -114,9 +116,9 @@ def test_route_prompt_view_is_slim_and_bounded() -> None:
         user.split("<user_input>")[1].split("</user_input>")[0]
     )
     view = payload["places"]
-    # 축약 뷰: 5개 필드만 (13개 optional 필드 미포함 — 컨텍스트 비대 방지)
+    # 축약 뷰: 6개 필드만 (13개 optional 필드 미포함 — 컨텍스트 비대 방지)
     assert set(view[0].keys()) == {
-        "place_id", "name", "lat", "lng", "recommended_visit_time",
+        "place_id", "day", "name", "lat", "lng", "recommended_visit_time",
     }
     assert "phone" not in view[1] and "place_url" not in view[1]
     assert all(len(v["name"]) <= 80 for v in view)

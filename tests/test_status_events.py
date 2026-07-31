@@ -102,8 +102,8 @@ class _StatusPublisher:
 
 _HAPPY_GEMINI = lambda: _SeqGemini([  # noqa: E731
     PlacesSelection(selections=[
-        PlaceSelection(index=0, recommended_visit_time="오전"),
-        PlaceSelection(index=1, recommended_visit_time="오후"),
+        PlaceSelection(index=0, day=1, recommended_visit_time="오전"),
+        PlaceSelection(index=1, day=1, recommended_visit_time="오후"),
     ]),
     RouteEnvelope(visit_order=[0, 1], legs=[
         Leg.model_validate({

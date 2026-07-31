@@ -190,7 +190,7 @@ def test_selection_prompt_escapes_review_injection() -> None:
 def test_reason_prompt_escapes_review_injection() -> None:
     """이유 프롬프트도 리뷰 스니펫을 이스케이프해 펜스를 유지한다."""
     place = Place(
-        place_id=0, name="장소0", address="주소",
+        place_id=0, day=1, name="장소0", address="주소",
         lat=37.5, lng=127.0, recommended_visit_time="오전",
         content_id="c0",
     )
@@ -217,8 +217,8 @@ def test_recommend_places_populates_reviews_state() -> None:
     })
     deps.set_hub_client(hub)
     deps.set_gemini_client(_SelectGemini(PlacesSelection(selections=[
-        PlaceSelection(index=0, recommended_visit_time="오전"),
-        PlaceSelection(index=1, recommended_visit_time="오후"),
+        PlaceSelection(index=0, day=1, recommended_visit_time="오전"),
+        PlaceSelection(index=1, day=1, recommended_visit_time="오후"),
     ])))
     state = {"job_id": "j", "request": _request(),
              "candidates": cands, "grounded": True}
@@ -237,7 +237,7 @@ def test_recommend_places_no_reviews_on_fetch_failure() -> None:
     cands = [_candidate(0), _candidate(1)]
     deps.set_hub_client(_ReviewHub(exc=httpx.ConnectError("down")))
     deps.set_gemini_client(_SelectGemini(PlacesSelection(selections=[
-        PlaceSelection(index=0, recommended_visit_time="오전"),
+        PlaceSelection(index=0, day=1, recommended_visit_time="오전"),
     ])))
     state = {"job_id": "j", "request": _request(),
              "candidates": cands, "grounded": True}

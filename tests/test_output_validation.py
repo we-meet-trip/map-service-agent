@@ -20,6 +20,7 @@ from app.schemas.agent_schemas import Place, PlaceSelection
 def _place(**overrides) -> Place:
     base = dict(
         place_id=0,
+        day=1,
         name="장소",
         address="주소",
         lat=37.5,
@@ -58,9 +59,9 @@ def test_place_rejects_control_chars_and_length() -> None:
 def test_selection_rejects_negative_index_and_tags() -> None:
     """PlaceSelection: 음수 index / 태그 문자 거부."""
     with pytest.raises(ValidationError):
-        PlaceSelection(index=-1, recommended_visit_time="오전")
+        PlaceSelection(index=-1, day=1, recommended_visit_time="오전")
     with pytest.raises(ValidationError):
-        PlaceSelection(index=0, recommended_visit_time="<오전>")
+        PlaceSelection(index=0, day=1, recommended_visit_time="<오전>")
 
 
 # ─── 인바운드 인증 ───────────────────────────────────────────────
