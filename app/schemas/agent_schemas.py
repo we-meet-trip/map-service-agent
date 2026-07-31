@@ -52,6 +52,10 @@ class Mobility(str, Enum):
 
     walk: 도보.
     bicycle: 자전거.
+    scooter: 전동 킥보드. SoT(def §3.6)의 kickboard 와 같은 개념이며,
+        hub 룰이 두 철자를 모두 받아 반경 7km 를 적용한다. 예전에는 이 값이
+        없어 BFF 가 킥보드를 bicycle 로 치환했고, 그 결과 킥보드 전용 반경이
+        한 번도 적용되지 않았다.
     car: 자가용/택시 등 자동차.
     transit: 대중교통(버스/지하철 등).
 
@@ -63,6 +67,7 @@ class Mobility(str, Enum):
     """
     walk = "walk"
     bicycle = "bicycle"
+    scooter = "scooter"
     car = "car"
     transit = "transit"
 
