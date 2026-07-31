@@ -40,6 +40,7 @@ def test_defaults() -> None:
     assert s.REVIEWS_MAX_PLACES == 3
     assert s.REVIEWS_DISPLAY == 3
     assert s.RULES_ENABLED is True
+    assert s.LOG_LEVEL == "INFO"
 
 
 def test_env_injection(monkeypatch) -> None:

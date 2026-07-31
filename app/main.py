@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -60,11 +61,33 @@ from app.schemas.agent_schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _configure_logging(level: str) -> None:
+    """루트 로거에 stdout 핸들러를 붙인다(핸들러가 없을 때만).
+
+    uvicorn 의 기본 로깅 설정은 `uvicorn*` 로거만 구성하고 루트 로거는
+    건드리지 않는다. 그래서 이 함수 없이는 `app.*` 로거로 남긴 기록이
+    출력 대상을 못 찾아 전량 유실된다.
+
+    이미 핸들러가 있으면(uvicorn `--log-config`, 테스트 하니스, 상위
+    호스트가 설정한 경우) 그 설정을 존중하고 아무것도 하지 않는다 —
+    핸들러를 덧붙이면 같은 로그가 두 줄씩 출력된다.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    logging.basicConfig(
+        level=level.upper(),
+        stream=sys.stdout,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan — 시작 시 외부 클라이언트 및 그래프 준비, 종료 시 정리.
 
     동작:
+      - `_configure_logging(LOG_LEVEL)` 로 루트 로거를 가장 먼저 세운다.
       - `get_settings()` 로 환경설정을 읽고, `GEMINI_API_KEY` 가 비어 있으면
         `RuntimeError("GEMINI_API_KEY is required")` 로 즉시 실패.
       - `INTERNAL_SERVICE_TOKEN` 이 설정되어 있으면 그 SecretStr 평문 값을
@@ -87,6 +110,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
       - `reset_all()` 로 모든 전역 슬롯을 None 으로 되돌린다.
     """
     settings = get_settings()
+    # 로깅은 다른 어떤 초기화보다 먼저 — 아래 fail-fast 게이트가 걸릴 때도
+    # 원인이 stdout 에 남아야 한다.
+    _configure_logging(settings.LOG_LEVEL)
     if not settings.GEMINI_API_KEY.get_secret_value():
         raise RuntimeError("GEMINI_API_KEY is required")
 

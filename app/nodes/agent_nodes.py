@@ -1015,9 +1015,16 @@ async def _invent_places(state: AgentState) -> AgentState:
             max_calls=get_settings().GEMINI_MAX_CALLS_PER_REQUEST,
         )
     except Exception as e:
+        logger.warning(
+            "recommend_places(invent) failed job_id=%s err=%s: %s",
+            state.get("job_id"), type(e).__name__, e,
+        )
         state["error"] = f"recommend_places failed: {e}"
         return state
     if not envelope.places:
+        logger.warning(
+            "recommend_places(invent) empty job_id=%s", state.get("job_id")
+        )
         state["error"] = "recommend_places returned empty"
         return state
     # place_id 정규화(0..N-1) + 실측 근거 없음 표시.
@@ -1027,6 +1034,18 @@ async def _invent_places(state: AgentState) -> AgentState:
     ]
     state["places"] = normalized
     return state
+
+
+def _log_route_reject(state: AgentState, reason: str) -> None:
+    """recommend_route 의 응답 검증 실패를 관측 가능하게 기록한다.
+
+    검증 실패는 예외가 아니라 state["error"] 설정으로 처리되므로, 여기서
+    남기지 않으면 어떤 검증 항목에서 잡이 죽었는지 로그로 알 수 없다.
+    """
+    logger.warning(
+        "recommend_route rejected job_id=%s reason=%s",
+        state.get("job_id"), reason,
+    )
 
 
 async def recommend_route(state: AgentState) -> AgentState:
@@ -1065,6 +1084,10 @@ async def recommend_route(state: AgentState) -> AgentState:
             max_calls=get_settings().GEMINI_MAX_CALLS_PER_REQUEST,
         )
     except Exception as e:
+        logger.warning(
+            "recommend_route failed job_id=%s err=%s: %s",
+            state.get("job_id"), type(e).__name__, e,
+        )
         state["error"] = f"recommend_route failed: {e}"
         return state
 
@@ -1073,16 +1096,24 @@ async def recommend_route(state: AgentState) -> AgentState:
         len(envelope.visit_order) != len(valid_ids)
         or set(envelope.visit_order) != valid_ids
     ):
+        _log_route_reject(
+            state, "visit_order must be a permutation of place ids"
+        )
         state["error"] = "visit_order must be a permutation of place ids"
         return state
     if len(envelope.legs) != max(len(places) - 1, 0):
+        _log_route_reject(
+            state, "legs length must equal len(places) - 1"
+        )
         state["error"] = "legs length must equal len(places) - 1"
         return state
     for leg in envelope.legs:
         if leg.from_place_id not in valid_ids:
+            _log_route_reject(state, "leg.from references unknown place_id")
             state["error"] = "leg.from references unknown place_id"
             return state
         if leg.to_place_id not in valid_ids:
+            _log_route_reject(state, "leg.to references unknown place_id")
             state["error"] = "leg.to references unknown place_id"
             return state
 
@@ -1094,6 +1125,9 @@ async def recommend_route(state: AgentState) -> AgentState:
             envelope.legs[i].from_place_id != envelope.visit_order[i]
             or envelope.legs[i].to_place_id != envelope.visit_order[i + 1]
         ):
+            _log_route_reject(
+                state, f"leg {i} does not connect consecutive visit_order"
+            )
             state["error"] = (
                 f"leg {i} must connect visit_order[{i}] to visit_order[{i + 1}]"
             )
@@ -1245,6 +1279,13 @@ async def publish_done(state: AgentState) -> AgentState:
     job_id = state["job_id"]
     publisher = get_streams_publisher()
     if state.get("error"):
+        # 잡 실패는 예외가 아니라 정상 반환으로 흘러가므로(_run_job 의
+        # except 절에 걸리지 않는다) 여기서 남기지 않으면 실패한 잡이
+        # agent 로그에 단 한 줄도 남지 않는다.
+        logger.warning(
+            "job failed job_id=%s error=%s degraded=%s",
+            job_id, state["error"], state.get("degraded_reason"),
+        )
         payload = JobDonePayload(
             job_id=job_id, status="failed", error=state["error"]
         )

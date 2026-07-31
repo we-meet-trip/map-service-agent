@@ -147,6 +147,12 @@ class AgentSettings(BaseSettings):
       SHUTDOWN_GRACE_SECONDS: lifespan 종료 시 진행 중 백그라운드 잡들이
                               마무리되길 기다리는 한도. 초과하면 cancel.
                               JOB_TIMEOUT_SECONDS + 10s 로 연동한다.
+
+    관측(로깅):
+      LOG_LEVEL: 루트 로거 레벨. uvicorn 은 자기 로거만 구성하고 루트
+                 로거에는 핸들러를 붙이지 않으므로, `app/main.py` 의
+                 `_configure_logging` 이 부팅 시 루트 핸들러가 비어 있을
+                 때만 stdout 핸들러를 붙여 `app.*` 로그를 살린다.
     """
 
     model_config = SettingsConfigDict(
@@ -198,6 +204,8 @@ class AgentSettings(BaseSettings):
     JOB_TIMEOUT_SECONDS: float = 300.0
     GEMINI_TIMEOUT_SECONDS: float = 100.0
     SHUTDOWN_GRACE_SECONDS: float = 310.0
+
+    LOG_LEVEL: str = "INFO"
 
 
 # _settings
