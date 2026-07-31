@@ -263,3 +263,70 @@ def test_select_places_skips_bad_coord_candidate():
     assert [p.place_id for p in places] == [0, 1]
     assert places[0].name == "코스0"
     assert places[1].name == "코스2"
+
+
+class _RecordingHub:
+    """테마별 조회를 기록하는 대역(팬아웃 검증용). 검색어마다 다른 후보 반환."""
+
+    def __init__(self, per_keyword: dict):
+        self._per_keyword = per_keyword
+        self.keywords: list = []
+
+    async def search_places(
+        self, province, city, *, mobility=None, keyword=None, size=15
+    ):
+        self.keywords.append(keyword)
+        return {"places": self._per_keyword.get(keyword, [])}
+
+
+def test_search_places_fans_out_per_theme_and_dedupes():
+    """테마마다 따로 조회하고 content_id 로 합친다(모든 테마 반영).
+
+    예전에는 테마를 공백으로 이어붙여 검색어 하나로 보냈고, Kakao 가 그
+    문자열을 통째로 매칭해 조합에 따라 0건이 나왔다.
+    """
+    shared = _candidate(0)          # 두 테마 결과에 공통으로 등장 → 1건으로 합침
+    only_cafe = _candidate(1)
+    hub = _RecordingHub({
+        "맛집": [shared],
+        "카페": [shared, only_cafe],
+    })
+    deps.set_hub_client(hub)
+    try:
+        state = {"job_id": "j", "request": _request().model_copy(update={"theme": ["food", "cafe"]})}
+        out = asyncio.run(search_places(state))
+    finally:
+        deps.reset_all()
+
+    # 테마 코드가 한국어 검색어로 매핑되어 각각 조회됐다.
+    assert hub.keywords == ["맛집", "카페"]
+    # content_id 중복은 제거된다.
+    ids = [c["content_id"] for c in out["candidates"]]
+    assert ids == [shared["content_id"], only_cafe["content_id"]]
+    assert out["grounded"] is True
+
+
+def test_search_places_without_theme_queries_region_once():
+    """테마가 없으면 검색어 없이 1회만 조회한다(hub 가 행정구역명으로 검색)."""
+    hub = _RecordingHub({None: [_candidate(0)]})
+    deps.set_hub_client(hub)
+    try:
+        state = {"job_id": "j", "request": _request().model_copy(update={"theme": None})}
+        out = asyncio.run(search_places(state))
+    finally:
+        deps.reset_all()
+
+    assert hub.keywords == [None]
+    assert len(out["candidates"]) == 1
+
+
+def test_theme_keywords_maps_known_and_keeps_unknown():
+    """알려진 테마는 한국어로 매핑하고, 모르는 값은 원문을 그대로 쓴다."""
+    from app.nodes.agent_nodes import _theme_keywords
+
+    assert _theme_keywords(["food", "night"]) == ["맛집", "야경"]
+    assert _theme_keywords(["산책"]) == ["산책"]
+    assert _theme_keywords([]) == [None]
+    assert _theme_keywords(None) == [None]
+    # 같은 검색어로 수렴하는 중복은 한 번만 조회한다.
+    assert _theme_keywords(["food", "food"]) == ["맛집"]

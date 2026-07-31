@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import timedelta
@@ -136,6 +137,73 @@ _ROUTE_SYSTEM = (
     "5. 응답은 지정된 JSON 스키마에 정확히 부합해야 하며, JSON 외의\n"
     "   텍스트를 출력하지 마십시오.\n"
 )
+
+
+# ─── 테마 → Kakao 검색어 매핑 ────────────────────────────────────
+# client 가 보내는 테마 코드(trip_step3_screen.dart 의 8종)를 Kakao 지역검색이
+# 실제로 매칭할 수 있는 한국어 단어로 옮긴다. 코드를 그대로 보내면 영문
+# 키워드 매칭이라 결과 품질이 낮고, 여러 코드를 공백으로 이어붙이면 Kakao 가
+# 그 문자열을 통째로 매칭해 조합에 따라 0건이 된다(실측: "food photo" → 0건).
+# 그래서 조합을 만들지 않고 테마마다 따로 조회한 뒤 합친다.
+_THEME_KEYWORDS: dict[str, str] = {
+    "food": "맛집",
+    "cafe": "카페",
+    "photo": "명소",
+    "nature": "공원",
+    "history": "문화재",
+    "activity": "체험",
+    "shopping": "쇼핑",
+    "night": "야경",
+}
+
+# 한 요청에서 hub 로 보낼 최대 조회 수. 테마 수만큼 Kakao 호출이 늘어나므로
+# 상한을 둔다(client 선택지가 8종이라 실질 상한이기도 하다).
+_THEME_QUERY_MAX = 8
+
+
+def _theme_keywords(themes: list[str] | None) -> list[str | None]:
+    """테마 리스트를 hub 조회용 검색어 리스트로 바꾼다.
+
+    매핑되지 않은 테마(사용자 정의 문자열 등)는 원문을 그대로 검색어로 쓴다.
+    테마가 없거나 전부 비어 있으면 `[None]` 을 돌려주는데, 이때 hub 는
+    "{province} {city}" 로 검색해 해당 행정구역의 대표 장소를 반환한다.
+    반환 리스트는 항상 최소 1개다(= 조회를 최소 1회는 한다).
+    """
+    if not themes:
+        return [None]
+    seen: list[str | None] = []
+    for t in themes[:_THEME_QUERY_MAX]:
+        if not isinstance(t, str) or not t.strip():
+            continue
+        kw = _THEME_KEYWORDS.get(t.strip().lower(), t.strip())
+        if kw not in seen:
+            seen.append(kw)
+    return seen or [None]
+
+
+def _merge_place_results(results) -> list[dict]:
+    """테마별 조회 결과를 content_id 기준으로 합친다(순서 보존).
+
+    content_id 가 없는 후보는 대조 불가라 그대로 통과시킨다. dict 가 아닌
+    원소는 여기서 걸러 하류(프롬프트 뷰·Place 변환)의 AttributeError 를
+    원천 차단한다.
+    """
+    merged: list[dict] = []
+    seen_ids: set[str] = set()
+    for resp in results:
+        places = resp.get("places", []) if isinstance(resp, dict) else []
+        if not isinstance(places, list):
+            continue
+        for c in places:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("content_id")
+            if cid is not None:
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+            merged.append(c)
+    return merged
 
 
 def _safe_request_view(req: AgentRequest) -> dict:
@@ -328,11 +396,19 @@ async def search_places(state: AgentState) -> AgentState:
 
     req = state["request"]
     client = get_hub_client()
-    keyword = " ".join(req.theme) if req.theme else None
     mobility = req.mobility.value if req.mobility else None
+    keywords = _theme_keywords(req.theme)
     try:
-        resp = await client.search_places(
-            req.province, req.city, mobility=mobility, keyword=keyword
+        # 테마별로 병렬 조회한 뒤 content_id 로 합친다. 예전에는 테마를 공백으로
+        # 이어붙여 검색어 하나로 보냈는데, Kakao 는 그 문자열을 그대로 매칭하므로
+        # 조합에 따라 0건이 나왔고(예: "food photo") 후보가 붕괴해 잡이 실패했다.
+        results = await asyncio.gather(
+            *(
+                client.search_places(
+                    req.province, req.city, mobility=mobility, keyword=kw
+                )
+                for kw in keywords
+            )
         )
     except (httpx.HTTPError, ValueError) as e:
         # 전송 실패뿐 아니라 200 응답이 JSON 으로 디코드되지 않는 경우
@@ -341,14 +417,7 @@ async def search_places(state: AgentState) -> AgentState:
         state["candidates"] = []
         state["grounded"] = False
         return state
-    # 응답이 dict 가 아니면(예상 밖 형태) 후보 없음으로 저하한다.
-    candidates = resp.get("places", []) if isinstance(resp, dict) else []
-    # 원소 단위 방어: dict 가 아닌 후보(예상 밖 형태)는 이 시점에 걸러
-    # 하류(프롬프트 뷰·Place 변환)의 AttributeError 를 원천 차단한다.
-    if isinstance(candidates, list):
-        candidates = [c for c in candidates if isinstance(c, dict)]
-    else:
-        candidates = []
+    candidates = _merge_place_results(results)
     # Mode 1 재탐색(stage="mode1")의 exclude 반영: 직전 추천 장소의
     # content_id 를 후보에서 제거한다(SoT §6.2 exclude_list). content_id
     # 가 없는 후보는 대조 불가라 통과시킨다. 전량 제외되면 아래의 기존
