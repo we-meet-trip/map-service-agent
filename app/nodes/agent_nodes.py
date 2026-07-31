@@ -930,6 +930,10 @@ async def _select_places(
             max_calls=get_settings().GEMINI_MAX_CALLS_PER_REQUEST,
         )
     except Exception as e:
+        logger.warning(
+            "recommend_places(select) failed job_id=%s err=%s: %s",
+            state.get("job_id"), type(e).__name__, e,
+        )
         state["error"] = f"recommend_places failed: {e}"
         return state
 
@@ -941,6 +945,7 @@ async def _select_places(
             chosen.append((sel.index, sel.recommended_visit_time))
 
     places: list[Place] = []
+    dropped = 0
     for idx, visit_time in chosen:
         try:
             places.append(
@@ -957,8 +962,34 @@ async def _select_places(
         ):
             # 좌표 누락·비정상 값·비-dict 원소 등으로 Place 생성이 실패한
             # 후보는 건너뛰고 나머지 후보로 계속 진행한다.
+            dropped += 1
             continue
+    if dropped:
+        logger.warning(
+            "recommend_places(select) dropped %d/%d candidates job_id=%s",
+            dropped, len(chosen), state.get("job_id"),
+        )
     if not places:
+        logger.warning(
+            "recommend_places(select) empty job_id=%s "
+            "candidates=%d selections=%d chosen=%d",
+            state.get("job_id"), len(candidates),
+            len(envelope.selections), len(chosen),
+        )
+        # 실측 후보로 장소를 못 만든 경우에도 잡 전체를 실패시키지 않고 생성
+        # 경로로 한 번 더 시도한다. 후보가 극히 적거나(예: 검색어 조합 때문에
+        # 1건만 남음) LLM 이 유효 index 를 못 고르면 여기로 오는데, 예전에는
+        # 곧바로 error 를 세워 BFF 502 로 이어졌다. 잔여 예산이 없으면 기존대로
+        # 실패시킨다(예산 초과 방지).
+        settings = get_settings()
+        budget = settings.GEMINI_MAX_CALLS_PER_REQUEST
+        if state.get("llm_calls_used", 0) < budget:
+            logger.warning(
+                "recommend_places falling back to invent job_id=%s",
+                state.get("job_id"),
+            )
+            state["degraded_reason"] = "select_empty_fallback_to_invent"
+            return await _invent_places(state)
         state["error"] = "recommend_places returned empty"
         return state
     state["places"] = places

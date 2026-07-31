@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from app import agent_dependencies as deps
+from app.agent_settings import get_settings
 from app.nodes.agent_nodes import (
     _place_from_candidate,
     recommend_places,
@@ -263,6 +264,90 @@ def test_select_places_skips_bad_coord_candidate():
     assert [p.place_id for p in places] == [0, 1]
     assert places[0].name == "코스0"
     assert places[1].name == "코스2"
+
+
+class _SeqGemini:
+    """호출 순서대로 다른 결과를 돌려주는 대역(선택 → 생성 폴백 검증용)."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = 0
+
+    async def generate_structured(
+        self, prompt, schema, *, system_instruction=None
+    ):
+        self.calls += 1
+        return self._results.pop(0)
+
+
+def test_select_empty_falls_back_to_invent_instead_of_failing():
+    """선택 결과가 비면 잡을 실패시키지 않고 생성 경로로 폴백한다.
+
+    후보가 극히 적거나 LLM 이 유효 index 를 못 고르면 선택 결과가 빈다.
+    예전에는 곧바로 error 를 세워 BFF 502 로 이어졌다. 이제는 남은 예산이
+    있으면 _invent_places 로 한 번 더 시도해야 한다.
+    """
+    # 1차: 범위 밖 index 만 반환 → 선택 0건. 2차: 생성 경로가 장소 1건 반환.
+    bad_selection = PlacesSelection(
+        selections=[PlaceSelection(index=99, recommended_visit_time="오전")]
+    )
+    invented = PlacesEnvelope(
+        places=[
+            Place(
+                place_id=0,
+                name="생성장소",
+                address="addr",
+                lat=37.5,
+                lng=127.0,
+                recommended_visit_time="오전",
+            )
+        ]
+    )
+    gemini = _SeqGemini([bad_selection, invented])
+    deps.set_gemini_client(gemini)
+    try:
+        state = {
+            "job_id": "j",
+            "request": _request(),
+            "candidates": [_candidate(0)],
+            "grounded": True,
+        }
+        out = asyncio.run(recommend_places(state))
+    finally:
+        deps.reset_all()
+
+    assert out.get("error") is None, "폴백이 동작하면 잡이 실패하면 안 된다"
+    assert len(out["places"]) == 1
+    assert out["places"][0].grounded is False
+    assert out.get("degraded_reason") == "select_empty_fallback_to_invent"
+    assert gemini.calls == 2
+
+
+def test_select_empty_without_budget_still_fails():
+    """예산이 남지 않으면 폴백하지 않고 기존대로 실패한다(예산 초과 방지)."""
+    bad_selection = PlacesSelection(
+        selections=[PlaceSelection(index=99, recommended_visit_time="오전")]
+    )
+    gemini = _SeqGemini([bad_selection])
+    deps.set_gemini_client(gemini)
+    try:
+        state = {
+            "job_id": "j",
+            "request": _request(),
+            "candidates": [_candidate(0)],
+            "grounded": True,
+            # 선택 호출이 마지막 예산을 소비하도록 상한-1 을 미리 채운다
+            # (상한이 바뀌어도 "선택 후 잔여 0" 조건이 유지된다).
+            "llm_calls_used": (
+                get_settings().GEMINI_MAX_CALLS_PER_REQUEST - 1
+            ),
+        }
+        out = asyncio.run(recommend_places(state))
+    finally:
+        deps.reset_all()
+
+    assert out["error"] == "recommend_places returned empty"
+    assert gemini.calls == 1
 
 
 class _RecordingHub:
