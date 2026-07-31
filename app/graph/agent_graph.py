@@ -5,20 +5,27 @@
 호출해 `app.state.graph` 에 저장하고, `_run_job` 이
 `graph.ainvoke({"job_id": ..., "request": ...}, config=...)` 로 실행한다.
 
-파이프라인 (SoT §6.1 C1 흐름):
+파이프라인:
   parse_input -> fetch_weather -> search_places
-  -> rules_filter -> score_and_rank      (hub /v1/rules/* 대기 — no-op)
+  -> rules_filter -> score_and_rank      (hub /v1/rules/*)
   -> recommend_places -> recommend_route
   -> llm_reason                          (정상 경로 한정, 실패 시 degrade)
+  -> summarize_reviews                   (정상 경로 한정, 실패 시 degrade)
   -> build_payload -> publish_done
+
+stage="route" 분기:
+  사용자가 방문지를 이미 골라 온 요청은 탐색·선정 구간이 통째로 불필요하다.
+  fetch_weather 다음에서 갈라져 load_given_places 로 장소를 세운 뒤 곧장
+  recommend_route 에 합류한다(이후 구간은 공용). LLM 호출은 동선 1 + 이유 1
+  + 요약 1 로 초기 추천보다 1회 적다.
 
 에러 라우팅 (`_route_after`):
   parse_input / fetch_weather / recommend_places / recommend_route 중
   어느 노드든 `state["error"]` 를 설정하면 후속 노드를 건너뛰고
-  `build_payload` 로 단축 분기한다. llm_reason 은 error 를 만들지 않는
-  enhancement 노드(실패 시 degrade)이므로, 그 뒤는 단순 엣지로
-  `build_payload` 에 수렴한다. `publish_done` 은 항상 호출되어
-  성공/실패 한쪽 `JobDonePayload` 를 Redis Streams 에 게시한다.
+  `build_payload` 로 단축 분기한다. llm_reason 과 summarize_reviews 는
+  error 를 만들지 않는 enhancement 노드(실패 시 degrade)이므로, 그
+  뒤는 단순 엣지로 `build_payload` 에 수렴한다. `publish_done` 은 항상
+  호출되어 성공/실패 한쪽 `JobDonePayload` 를 Redis Streams 에 게시한다.
   (각 노드도 `state["error"]` 를 보고 자체 no-op 하므로, 단축 분기는
   불필요한 LLM/HTTP 호출을 줄이는 최적화다.)
 
@@ -36,6 +43,7 @@ from app.nodes.agent_nodes import (
     build_payload,
     fetch_weather,
     llm_reason,
+    load_given_places,
     parse_input,
     publish_done,
     recommend_places,
@@ -43,6 +51,7 @@ from app.nodes.agent_nodes import (
     rules_filter,
     score_and_rank,
     search_places,
+    summarize_reviews,
 )
 
 
@@ -55,6 +64,15 @@ def _route_after(next_node: str):
     return _router
 
 
+def _route_after_weather(state: AgentState) -> str:
+    """날씨 다음 갈림길 — 장소를 찾을지, 받은 장소를 쓸지 고른다."""
+    if state.get("error"):
+        return "build_payload"
+    if state["request"].stage == "route":
+        return "load_given_places"
+    return "search_places"
+
+
 def build_graph(checkpointer=None):
     """추천 파이프라인 노드를 연결한 컴파일된 StateGraph 인스턴스를 반환한다.
 
@@ -64,12 +82,14 @@ def build_graph(checkpointer=None):
     graph = StateGraph(AgentState)
     graph.add_node("parse_input", parse_input)
     graph.add_node("fetch_weather", fetch_weather)
+    graph.add_node("load_given_places", load_given_places)
     graph.add_node("search_places", search_places)
     graph.add_node("rules_filter", rules_filter)
     graph.add_node("score_and_rank", score_and_rank)
     graph.add_node("recommend_places", recommend_places)
     graph.add_node("recommend_route", recommend_route)
     graph.add_node("llm_reason", llm_reason)
+    graph.add_node("summarize_reviews", summarize_reviews)
     graph.add_node("build_payload", build_payload)
     graph.add_node("publish_done", publish_done)
 
@@ -79,11 +99,22 @@ def build_graph(checkpointer=None):
         _route_after("fetch_weather"),
         {"fetch_weather": "fetch_weather", "build_payload": "build_payload"},
     )
+    # 사용자가 방문지를 골라 온 요청(stage=route)은 탐색·선정 구간을 건너뛴다.
     graph.add_conditional_edges(
         "fetch_weather",
-        _route_after("search_places"),
+        _route_after_weather,
         {
             "search_places": "search_places",
+            "load_given_places": "load_given_places",
+            "build_payload": "build_payload",
+        },
+    )
+    # 장소가 이미 정해졌으므로 곧장 동선 단계로 합류한다.
+    graph.add_conditional_edges(
+        "load_given_places",
+        _route_after("recommend_route"),
+        {
+            "recommend_route": "recommend_route",
             "build_payload": "build_payload",
         },
     )
@@ -111,7 +142,10 @@ def build_graph(checkpointer=None):
             "build_payload": "build_payload",
         },
     )
-    graph.add_edge("llm_reason", "build_payload")
+    # 두 enhancement 노드는 직렬이다 — 요약 노드가 llm_reason 이 남긴
+    # 예산 잔량을 보고 자기 호출 여부를 정하므로 순서가 의미를 갖는다.
+    graph.add_edge("llm_reason", "summarize_reviews")
+    graph.add_edge("summarize_reviews", "build_payload")
     graph.add_edge("build_payload", "publish_done")
     graph.add_edge("publish_done", END)
     return graph.compile(checkpointer=checkpointer)
