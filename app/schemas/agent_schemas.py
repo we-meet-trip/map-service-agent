@@ -107,6 +107,8 @@ class Place(BaseModel):
       populate_by_name=True — 필드명 직접 입력과 alias 입력 모두 허용.
 
     place_id: 장소 식별자(정수). `recommend_places` 노드가 0..N-1 로 정규화한다.
+    day: 여행 일차(1부터 시작). LLM 이 `_build_places_prompt` 지시에 따라
+         날짜 범위 안에서 직접 배정한다. 1..num_days 범위를 벗어나면 검증 실패.
     name: 장소명.
     address: 주소 문자열.
     lat: 위도. ge=33.0, le=43.0 — 한국 국내 위도 범위 밖이면 검증 실패.
@@ -116,11 +118,13 @@ class Place(BaseModel):
     사용처:
       - LLM 응답 검증의 단위 모델(`PlacesEnvelope.places` 원소).
       - `Leg.from_place_id` / `Leg.to_place_id` 가 본 `place_id` 를 참조.
-      - `JobDonePayload.places` 의 원소.
+      - `JobDonePayload.places` 의 원소. user(BFF) 가 이 `day` 를 그대로
+        `TripStop.day` 로 전달해 client 가 일차별 탭을 그린다.
     """
     model_config = ConfigDict(populate_by_name=True)
 
     place_id: int
+    day: int = Field(ge=1)
     name: str
     address: str
     lat: float = Field(ge=33.0, le=43.0)
