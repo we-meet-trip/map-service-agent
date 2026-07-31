@@ -349,6 +349,11 @@ async def parse_input(state: AgentState) -> AgentState:
       - date_start > date_end       → "date_start must be <= date_end"
       - 구간 > _MAX_RANGE_DAYS(14일) → "date range must be <= 14 days"
       - time_start >= time_end       → "time_start must be < time_end"
+      - stage="route" 인데 places 없음 → "stage=route requires places"
+
+    stage="route" 는 사용자가 고른 장소로 동선만 짜는 경로다. 장소 목록이
+    요청의 전부이므로 없으면 아무것도 할 수 없다(개수 범위는 스키마가
+    이미 강제하므로 여기서는 존재 여부만 본다).
 
     어떤 검사라도 실패하면 `state["error"]` 를 설정하고 즉시 반환한다.
     상태는 그대로 다음 노드로 흘러가지만, 후속 노드들은 본 키를 보고 no-op.
@@ -367,6 +372,51 @@ async def parse_input(state: AgentState) -> AgentState:
     if d.time_start >= d.time_end:
         state["error"] = "time_start must be < time_end"
         return state
+    if req.stage == "route" and not req.places:
+        state["error"] = "stage=route requires places"
+        return state
+    return state
+
+
+async def load_given_places(state: AgentState) -> AgentState:
+    """사용자가 고른 장소를 그대로 `state["places"]` 로 세운다.
+
+    stage="route" 전용 노드다. 후보 탐색·룰 필터·랭킹·선정을 모두 건너뛰므로
+    LLM 호출도 이 단계에서는 0회다 — 사용자가 이미 고른 것을 다시 고를 이유가
+    없다.
+
+    place_id 는 요청에 실린 순서대로 0..N-1 로 매긴다(선정 경로가 후보에
+    붙이는 방식과 같다). 이 번호가 뒤따르는 동선·이유·요약 노드가 장소를
+    지목하는 유일한 키다.
+
+    grounded=True 로 둔다 — 사용자가 지도에서 실제로 고른 지점이라 LLM 이
+    지어낸 장소와 신뢰도가 다르다. 방문 시각은 비워 둔다(동선이 정해진 뒤
+    BFF 가 활동 시간대를 나눠 채운다).
+
+    좌표·문자 검증은 요청 스키마가 이미 마쳤으므로 여기서 다시 하지 않는다.
+    """
+    await _emit_stage(state, "load_given_places")
+    if state.get("error"):
+        return state
+    req = state["request"]
+    selected = req.places or []
+    if not selected:
+        state["error"] = "stage=route requires places"
+        return state
+    state["places"] = [
+        Place(
+            place_id=i,
+            name=p.name,
+            address=p.address,
+            lat=p.lat,
+            lng=p.lng,
+            recommended_visit_time="",
+            content_id=p.content_id,
+            grounded=True,
+        )
+        for i, p in enumerate(selected)
+    ]
+    state["grounded"] = True
     return state
 
 

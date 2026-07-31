@@ -116,6 +116,37 @@ class DateRange(BaseModel):
     time_end: time
 
 
+class SelectedPlace(BaseModel):
+    """사용자가 직접 고른 방문지 1건 — stage="route" 요청의 입력.
+
+    사용자가 지도에서 장소를 골라 오면 후보 탐색·선정 단계를 건너뛰고 이
+    목록으로 바로 동선을 짠다. 그래서 좌표는 필수다(동선을 그릴 수 없다).
+
+    name: 장소명. 1~80자.
+    address: 주소. 표시용이라 동선 계산에 쓰이지 않는다. 키를 생략해도,
+             값이 null 로 와도 빈 문자열로 접는다 — 호출 측이 주소 없는
+             지점(지도에서 찍은 좌표 등)을 그대로 보낼 수 있어야 한다.
+    lat/lng: 좌표. 국내 범위 밖이면 검증 실패.
+    content_id: 실측 출처 식별자. 있으면 리뷰 조회에 그대로 쓰고, 없으면
+                이름으로 조회한다.
+    """
+    name: str = Field(min_length=1, max_length=80)
+    address: str = Field(default="", max_length=200)
+    lat: float = Field(ge=33.0, le=43.0)
+    lng: float = Field(ge=124.0, le=132.0)
+    content_id: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def _blank_when_null(cls, value):
+        """JSON `"address": null` 을 빈 문자열로 접는다."""
+        return "" if value is None else value
+
+    _no_tags = field_validator("name", "address", "content_id")(
+        _reject_tags_and_control
+    )
+
+
 class AgentRequest(BaseModel):
     """추천 요청 본문 — `/v1/recommend` POST 의 body.
 
@@ -129,12 +160,17 @@ class AgentRequest(BaseModel):
     schedule_id: user-BFF 의 일정 식별자(SoT §6.1 B2 body). 추적/영속화
                  연계용 패스스루 — agent 는 user_service 스키마를 읽지
                  않으므로 이 값으로 조회하지 않는다. nullable.
-    stage: 추천 단계. "init"(초기 추천) 또는 "mode1"(재탐색, SoT §6.2).
+    stage: 추천 단계.
+           "init"  — 조건만 받아 장소 탐색부터 하는 초기 추천.
+           "mode1" — 일부 장소를 빼고 다시 뽑는 재탐색.
+           "route" — 사용자가 places 로 고른 장소들의 동선만 짠다.
            기본 "init" — 기존 호출자 하위호환.
-    exclude: Mode 1 재탐색 시 재추천을 금지할 content_id 목록
-             (SoT §6.2 exclude_list). grounded 후보 필터에 사용된다.
-             invent(LLM 생성) 폴백에는 content_id 가 없어 적용 불가 —
-             한계는 search_places docstring 참조.
+    exclude: Mode 1 재탐색 시 재추천을 금지할 content_id 목록.
+             grounded 후보 필터에 사용된다. invent(LLM 생성) 폴백에는
+             content_id 가 없어 적용 불가 — 한계는 search_places docstring 참조.
+    places: stage="route" 에서 사용자가 고른 방문지 목록. 2~10개.
+            다른 stage 에서는 무시된다. 2개 미만이면 이을 구간이 없고,
+            10개를 넘으면 동선 프롬프트가 감당하기 어려워 상한을 둔다.
 
     호출 흐름:
       클라이언트 → `app.main.recommend(req)` → `_run_job` →
@@ -148,10 +184,13 @@ class AgentRequest(BaseModel):
     province: str = Field(min_length=1, max_length=20)
     city: str = Field(min_length=1, max_length=20)
     schedule_id: Optional[str] = Field(default=None, max_length=64)
-    stage: Literal["init", "mode1"] = "init"
+    stage: Literal["init", "mode1", "route"] = "init"
     exclude: Optional[
         List[Annotated[str, Field(min_length=1, max_length=64)]]
     ] = Field(default=None, max_length=50)
+    places: Optional[List[SelectedPlace]] = Field(
+        default=None, min_length=2, max_length=10
+    )
 
     @field_validator("stage", mode="before")
     @classmethod
