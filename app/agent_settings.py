@@ -30,9 +30,12 @@ class AgentSettings(BaseSettings):
       GEMINI_RPD_CAP: agent 자체 일일 상한(SoT R-01: 200/일, 50은 데모 예비).
                       GeminiRateLimiter 의 일일 카운터가 KST 자정 기준으로
                       집행한다.
-      GEMINI_MAX_CALLS_PER_REQUEST: 추천 요청 1건당 LLM 호출 하드 예산
-                      (SoT §2.3 "요청당 LLM ≤ 3회"). 교정 재시도 포함
-                      모든 호출이 본 예산을 소비한다.
+      GEMINI_MAX_CALLS_PER_REQUEST: 추천 요청 1건당 LLM 호출 하드 예산.
+                      교정 재시도 포함 모든 호출이 본 예산을 소비한다.
+                      정상 경로 소비 내역: 장소 선정 1 + 동선 1 +
+                      추천이유 1 + 리뷰요약 1 = 4. SUMMARY_ENABLED=false
+                      면 요약 노드가 예산을 쓰지 않으므로 실질 3회로
+                      줄어든다.
       GEMINI_TEMPERATURE: 생성 온도. 구조화 출력의 결정성을 위해 낮게 둔다.
       GEMINI_MAX_OUTPUT_TOKENS: 응답 토큰 상한. Gemini 2.5 계열은 thinking
                       토큰이 본 상한을 함께 소비하므로 과소 설정 시 JSON 이
@@ -94,9 +97,27 @@ class AgentSettings(BaseSettings):
                      블로그 리뷰 스니펫을 붙여 선정/이유 프롬프트를 보강한다.
                      리뷰 수집은 best-effort(실패해도 잡을 죽이지 않는다)이며
                      LLM 호출을 추가하지 않는다(hub HTTP 만 추가).
-      REVIEWS_MAX_PLACES: 리뷰를 조회할 상위 후보 수(SoT §7.1 추천당 2-5회
-                     이내). 랭킹 상위 K 개에만 조회한다.
+      REVIEWS_MAX_PLACES: 선정 단계에서 리뷰를 조회할 상위 후보 수.
+                     랭킹 상위 K 개에만 조회해 hub 왕복을 억제한다.
       REVIEWS_DISPLAY: 후보 1건당 hub 에 요청하는 리뷰 수(display).
+                     요약이 여러 글을 교차 대조할 수 있도록 5로 둔다.
+                     프롬프트 뷰는 이 중 앞 2건만 쓰고(토큰 절약), 요약
+                     노드가 전량을 근거로 쓴다.
+      REVIEWS_FETCH_CAP_PER_JOB: 잡 1건이 hub `/v1/reviews` 를 호출할 총
+                     상한. 선정 단계와 요약 단계가 이 예산을 공유하며,
+                     요약 단계는 남은 만큼만 추가 조회한다 — 장소 수에
+                     비례해 외부 API 호출이 무한히 늘어나는 것을 막되,
+                     모든 추천 장소가 요약을 받을 수 있는 여유는 남긴다.
+                     hub 가 6시간 캐시를 두므로 같은 장소 재조회는
+                     외부 API 호출로 이어지지 않는다.
+
+    블로그 요약(summarize_reviews) 관련:
+      SUMMARY_ENABLED: True(기본)면 llm_reason 다음에 summarize_reviews 가
+                     장소별 요약 2줄(bullets)을 만든다. False 면 노드가
+                     no-op 으로 통과하고 LLM 예산도 3콜 체제로 되돌아간다
+                     (kill-switch — 쿼터 압박·품질 회귀 시 즉시 무력화).
+      SUMMARY_MAX_PLACES: 요약을 만들 최대 장소 수. 프롬프트에 실리는
+                     스니펫 총량(장소 수 × REVIEWS_DISPLAY)의 상한이다.
 
     룰 엔진(hub `/v1/rules/*`) 관련:
       RULES_ENABLED: True(기본)면 rules_filter/score_and_rank 가 hub 룰
@@ -164,7 +185,7 @@ class AgentSettings(BaseSettings):
     GEMINI_RPM_LIMIT: int = 10
     GEMINI_RPD_LIMIT: int = 250
     GEMINI_RPD_CAP: int = 200
-    GEMINI_MAX_CALLS_PER_REQUEST: int = 3
+    GEMINI_MAX_CALLS_PER_REQUEST: int = 4
     GEMINI_TEMPERATURE: float = 0.2
     GEMINI_MAX_OUTPUT_TOKENS: int = 8192
     GEMINI_THINKING_BUDGET: int = 0
@@ -180,8 +201,16 @@ class AgentSettings(BaseSettings):
     AUTH_ENFORCED: bool = False
 
     REVIEWS_ENRICH_ENABLED: bool = True
-    REVIEWS_MAX_PLACES: int = 3  # SoT §7.1 추천당 2-5회 이내
-    REVIEWS_DISPLAY: int = 3
+    REVIEWS_MAX_PLACES: int = 3
+    REVIEWS_DISPLAY: int = 5  # hub 가 받는 상한은 10
+    # 선정 단계 3회 + 요약 단계가 남은 장소를 채울 여지. 추천 장소가 최대
+    # 7곳이고 선정 단계 조회분과 겹치지 않을 수 있어 7+3 을 상한으로 둔다.
+    REVIEWS_FETCH_CAP_PER_JOB: int = 10
+
+    SUMMARY_ENABLED: bool = True
+    # 추천 장소 수 상한(프롬프트가 5~7곳을 지시)과 맞춘다. 이 값이 더 작으면
+    # 뒷순번 장소는 구조적으로 요약을 못 받는다.
+    SUMMARY_MAX_PLACES: int = 7
 
     RULES_ENABLED: bool = True  # kill-switch — 장애 시 no-op 복귀
 

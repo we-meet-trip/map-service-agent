@@ -45,6 +45,32 @@ def _reject_tags_and_control(value):
     return value
 
 
+# bullets 1줄의 길이 상한. 블로그 요약은 카드 UI 두 줄에 들어가야 하므로
+# reason(200자)보다 짧게 잡는다.
+BULLET_MAX_LEN = 80
+
+
+def _reject_tags_and_control_list(value):
+    """문자열 리스트의 모든 원소에 `_reject_tags_and_control` 을 적용한다.
+
+    bullets 처럼 리스트 필드는 원소 단위 검증이 필요하다(Field 제약만으로는
+    항목 내부 문자를 막지 못한다). 길이 상한도 함께 본다 — 리뷰 원문이
+    그대로 새어 나오는 것(요약이 아닌 발췌)을 막는 실질 장치다.
+    """
+    if value is None:
+        return value
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("bullet must be a string")
+        stripped = item.strip()
+        if not stripped:
+            raise ValueError("bullet must not be blank")
+        if len(item) > BULLET_MAX_LEN:
+            raise ValueError(f"bullet exceeds {BULLET_MAX_LEN} characters")
+        _reject_tags_and_control(item)
+    return value
+
+
 class Mobility(str, Enum):
     """이동 수단 enum — 추천 동선이 가정하는 이동 모드.
 
@@ -206,8 +232,16 @@ class Place(BaseModel):
     # LLM 응답(ReasonEnvelope)에서 검증을 거친 값만 들어온다. 생성
     # 시점에는 없다가 build_payload 에서 model_copy 로 채워진다.
     reason: Optional[str] = Field(default=None, max_length=200)
+    # summarize_reviews 노드가 병합하는 장소별 블로그 리뷰 요약(2줄).
+    # 네이버 블로그 검색 스니펫을 LLM 이 종합한 결과이며, 원문 스니펫은
+    # 페이로드에 싣지 않는다(간접 인젝션 노출면 최소화). reason 과 같은
+    # 방식으로 생성 후 build_payload 에서 model_copy 로 채워진다.
+    bullets: Optional[List[str]] = Field(default=None, max_length=2)
 
     _no_tags_reason = field_validator("reason")(_reject_tags_and_control)
+    _no_tags_bullets = field_validator("bullets")(
+        _reject_tags_and_control_list
+    )
 
 
 class Leg(BaseModel):
@@ -312,6 +346,37 @@ class ReasonEnvelope(BaseModel):
     _no_tags = field_validator("clothing")(_reject_tags_and_control)
 
 
+class PlaceBullets(BaseModel):
+    """`summarize_reviews` 응답의 장소별 블로그 요약 1건.
+
+    place_id: 대상 장소의 place_id. `summarize_reviews` 노드가 유효 id
+              집합의 부분집합인지·무중복인지 semantic 검증한다.
+    bullets: 요약 줄. 각 줄은 1..BULLET_MAX_LEN 자, 태그/제어문자 금지.
+             하류 계약은 "정확히 2줄"이지만 스키마는 1~4줄을 받는다 —
+             줄 수를 스키마로 못 박으면 모델이 3줄을 쓴 순간 응답 전체가
+             검증에 걸려 모든 장소의 요약이 함께 사라진다. 개수 정규화는
+             노드가 맡아(2줄 미만 항목 폐기, 초과분 절단) 일부만 어긋난
+             경우에도 나머지 장소는 살린다.
+    """
+    place_id: int
+    bullets: List[str] = Field(min_length=1, max_length=4)
+
+    _no_tags = field_validator("bullets")(_reject_tags_and_control_list)
+
+
+class BulletsEnvelope(BaseModel):
+    """`summarize_reviews` 단계에서 LLM 이 돌려주는 구조화 응답의 루트.
+
+    items: 장소별 요약 리스트. 리뷰 스니펫을 확보한 장소만 대상이므로
+           요청한 장소 전부가 오지 않을 수 있다(부분 커버리지 허용).
+
+    사용처:
+      - `GeminiClient.generate_structured(prompt, BulletsEnvelope)` 의
+        `response_schema` (summarize_reviews 노드, LLM 4번째 호출).
+    """
+    items: List[PlaceBullets]
+
+
 class RouteEnvelope(BaseModel):
     """`recommend_route` 단계에서 LLM 이 돌려주는 구조화 응답의 루트.
 
@@ -332,7 +397,8 @@ class JobDonePayload(BaseModel):
 
     job_id: 어떤 잡의 결과인지 식별.
     status: Literal["done", "failed"]. 둘 중 하나만 허용.
-    places: 성공 시 추천 장소 리스트(장소별 reason 포함 가능). 실패 시 None.
+    places: 성공 시 추천 장소 리스트(장소별 reason·bullets 포함 가능).
+            실패 시 None.
     visit_order: 성공 시 방문 순서. 실패 시 None.
     legs: 성공 시 동선 구간 리스트. 실패 시 None.
     clothing: 성공 시 날씨 기반 옷차림 안내(llm_reason 산출). llm_reason

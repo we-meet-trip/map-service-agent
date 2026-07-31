@@ -6,6 +6,7 @@ import json
 from datetime import date, time
 
 from app import agent_dependencies as deps
+from app.agent_settings import get_settings
 from app.nodes.agent_nodes import build_payload, llm_reason, publish_done
 from app.schemas.agent_schemas import (
     AgentRequest,
@@ -87,11 +88,16 @@ def test_normal_full_coverage() -> None:
 
 
 def test_budget_exhausted_degrades() -> None:
-    """예산 소진 시 호출 없이 degrade(잡 실패 아님)."""
+    """예산 소진 시 호출 없이 degrade(잡 실패 아님).
+
+    소진 기준값은 설정에서 읽는다 — 예산 상한이 바뀌어도 "이미 다 썼다"
+    는 조건이 그대로 유지되게 한다.
+    """
     gemini = _SeqGemini([_envelope([0, 1])])
     deps.set_gemini_client(gemini)
+    max_calls = get_settings().GEMINI_MAX_CALLS_PER_REQUEST
     try:
-        out = asyncio.run(llm_reason(_state(llm_calls_used=3)))
+        out = asyncio.run(llm_reason(_state(llm_calls_used=max_calls)))
     finally:
         deps.reset_all()
     assert gemini.calls == 0

@@ -123,7 +123,7 @@ _HAPPY_GEMINI = lambda: _SeqGemini([  # noqa: E731
 _ALL_STAGES = [
     "parse_input", "fetch_weather", "search_places", "rules_filter",
     "score_and_rank", "recommend_places", "recommend_route", "llm_reason",
-    "build_payload",
+    "summarize_reviews", "build_payload",
 ]
 
 
