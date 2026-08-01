@@ -1,7 +1,8 @@
-"""POST /v1/reviews/summary — 장소 단건 요약 엔드포인트 테스트.
+"""요약 엔드포인트 테스트 — 단건과 배치.
 
-장소를 눌렀을 때 그 자리에서 요약을 돌려주는 경로다. 일정 생성 파이프라인과
-같은 프롬프트를 쓰되 잡을 만들지 않는다.
+장소를 눌렀을 때 그 자리에서 요약을 돌려주는 단건 경로와, 일정이 만들어진
+직후 그 일정의 장소를 미리 요약해 두는 배치 경로를 함께 다룬다. 둘 다 같은
+파이프라인을 돌고 같은 실패 규칙을 쓴다.
 
 다루는 범위:
   - 정상 요약 2줄
@@ -9,6 +10,8 @@
   - 호출 한도 → 429, 그 외 실패 → 502
   - 후기 없음/과다 → 요청 검증 실패
   - 후기 문자열이 프롬프트 구조를 깨지 못함
+  - 배치: 요청 위치로 결과를 짚고, 근거 없는 장소는 빠지며, 모델은 1회만
+  - 차단 스위치를 내리면 모델을 부르지 않고 빈 결과
 """
 from __future__ import annotations
 
@@ -16,9 +19,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main as agent_main
+from app.agent_settings import get_settings
 from app.llm.rate_limit import GeminiQuotaError
 from app.llm.structured_call import LLMBudgetExceeded
-from app.nodes.agent_nodes import (
+from app.nodes import summary_nodes
+from app.nodes.summary_nodes import (
     build_summary_prompt_from_views,
     summary_place_view,
 )
@@ -44,15 +49,29 @@ def _body(**overrides) -> dict:
     return base
 
 
-def _stub_call(monkeypatch, result=None, error=None):
-    """구조화 호출을 대역으로 갈아끼운다(실제 모델을 부르지 않는다)."""
+def _place(name: str, *descriptions: str) -> dict:
+    """배치 요청에 실을 장소 한 건."""
+    return {
+        "place_name": name,
+        "reviews": [{"description": d} for d in descriptions],
+    }
+
+
+def _stub_call(monkeypatch, result=None, error=None) -> dict:
+    """구조화 호출을 대역으로 갈아끼운다(실제 모델을 부르지 않는다).
+
+    반환한 dict 의 calls 로 모델 호출 횟수를 확인한다.
+    """
+    seen = {"calls": 0}
 
     async def _fake(state, prompt, schema, *, system_instruction, max_calls):
+        seen["calls"] += 1
         if error is not None:
             raise error
         return result
 
-    monkeypatch.setattr(agent_main, "call_structured", _fake)
+    monkeypatch.setattr(summary_nodes, "call_structured", _fake)
+    return seen
 
 
 def test_returns_two_lines(monkeypatch):
@@ -87,6 +106,15 @@ def test_too_few_lines_is_empty_not_error(monkeypatch):
 def test_empty_items_is_empty(monkeypatch):
     """항목 자체가 없으면 빈 목록."""
     _stub_call(monkeypatch, result=BulletsEnvelope(items=[]))
+    body = _client().post("/v1/reviews/summary", json=_body()).json()
+    assert body["bullets"] == []
+
+
+def test_invented_place_id_is_discarded(monkeypatch):
+    """요청하지 않은 번호로 답하면 폐기한다 — 지어낸 번호를 믿지 않는다."""
+    _stub_call(monkeypatch, result=BulletsEnvelope(items=[
+        PlaceBullets(place_id=7, bullets=["첫 줄", "둘째 줄"]),
+    ]))
     body = _client().post("/v1/reviews/summary", json=_body()).json()
     assert body["bullets"] == []
 
@@ -128,3 +156,76 @@ def test_prompt_fence_survives_malicious_review():
     assert user.count("<places>") == 1
     assert user.count("</places>") == 1
     assert _MALICIOUS not in user
+
+
+def test_disabled_returns_empty_without_calling_model(monkeypatch):
+    """차단 스위치를 내리면 모델을 부르지 않고 빈 목록으로 답한다."""
+    seen = _stub_call(monkeypatch, result=BulletsEnvelope(items=[]))
+    monkeypatch.setattr(get_settings(), "SUMMARY_ENABLED", False)
+    resp = _client().post("/v1/reviews/summary", json=_body())
+    assert resp.status_code == 200
+    assert resp.json()["bullets"] == []
+    assert seen["calls"] == 0
+
+
+# ─── 배치 경로 ───────────────────────────────────────────────────
+
+
+def test_batch_keys_results_by_request_index(monkeypatch):
+    """결과는 요청 배열의 위치로 짚는다 — 같은 이름이 겹쳐도 구분된다."""
+    _stub_call(monkeypatch, result=BulletsEnvelope(items=[
+        PlaceBullets(place_id=0, bullets=["가-1", "가-2"]),
+        PlaceBullets(place_id=1, bullets=["나-1", "나-2"]),
+    ]))
+    resp = _client().post("/v1/reviews/summary/batch", json={
+        "places": [_place("속초해변", "곱다"), _place("속초해변", "붐빈다")],
+    })
+    assert resp.status_code == 200
+    assert resp.json()["results"] == [
+        {"index": 0, "bullets": ["가-1", "가-2"]},
+        {"index": 1, "bullets": ["나-1", "나-2"]},
+    ]
+
+
+def test_batch_uses_one_model_call_for_all_places(monkeypatch):
+    """장소가 늘어도 모델 호출은 1회다 — 분당 상한을 지키는 근거다."""
+    seen = _stub_call(monkeypatch, result=BulletsEnvelope(items=[
+        PlaceBullets(place_id=i, bullets=[f"{i}-1", f"{i}-2"])
+        for i in range(3)
+    ]))
+    resp = _client().post("/v1/reviews/summary/batch", json={
+        "places": [_place(f"장소{i}", "후기") for i in range(3)],
+    })
+    assert resp.status_code == 200
+    assert len(resp.json()["results"]) == 3
+    assert seen["calls"] == 1
+
+
+def test_batch_partial_coverage_omits_uncovered(monkeypatch):
+    """요약을 못 만든 장소는 결과에서 빠진다 — 부분 커버리지는 정상이다."""
+    _stub_call(monkeypatch, result=BulletsEnvelope(items=[
+        PlaceBullets(place_id=0, bullets=["가-1", "가-2"]),
+        PlaceBullets(place_id=2, bullets=["다-1", "다-2"]),
+    ]))
+    resp = _client().post("/v1/reviews/summary/batch", json={
+        "places": [_place(f"장소{i}", "후기") for i in range(3)],
+    })
+    indexes = [r["index"] for r in resp.json()["results"]]
+    assert indexes == [0, 2]
+
+
+def test_batch_rate_limited_returns_429(monkeypatch):
+    """배치도 단건과 같은 한도 규칙을 쓴다."""
+    _stub_call(monkeypatch, error=LLMBudgetExceeded())
+    resp = _client().post("/v1/reviews/summary/batch", json={
+        "places": [_place("속초해변", "곱다")],
+    })
+    assert resp.status_code == 429
+
+
+def test_batch_rejects_too_many_places():
+    """한 번에 담을 수 있는 장소 수를 넘기면 거절한다."""
+    resp = _client().post("/v1/reviews/summary/batch", json={
+        "places": [_place(f"장소{i}", "후기") for i in range(8)],
+    })
+    assert resp.status_code == 422

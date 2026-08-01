@@ -5,7 +5,7 @@ MAP 서비스의 추천 엔진. FastAPI + LangGraph + Gemini 2.5 Flash.
 ## 역할
 
 - LangGraph 노드 그래프 구성·실행 (입력 파싱 → 날씨 조회 → 장소 검색 → 보강 → 점수·랭킹 → 추천 이유 생성)
-- Gemini 2.5 Flash 직접 호출 (요청당 LLM ≤ 3회)
+- Gemini 2.5 Flash 직접 호출 (추천 요청당 LLM ≤ 3회, 블로그 요약은 별도 파이프라인)
 - hub의 결정적 룰 엔진을 통과한 후보 풀 안에서 LLM이 자율 선택
 - 자체 데이터 소유 없음 — POI · 날씨 · 경로는 hub의 REST API로 조회
 - stateless — 일정 단위 정책은 user-BFF가 강제, agent는 요청마다 독립 실행
@@ -20,8 +20,10 @@ map-service-agent/
 └── app/
     ├── __init__.py
     ├── main.py                   FastAPI 진입점 + /health
-    ├── graph/agent_graph.py      LangGraph StateGraph 정의
-    ├── nodes/agent_nodes.py      그래프 노드 함수
+    ├── graph/agent_graph.py      추천 파이프라인 StateGraph 정의
+    ├── graph/summary_graph.py    블로그 요약 파이프라인 StateGraph 정의
+    ├── nodes/agent_nodes.py      추천 파이프라인 노드 함수
+    ├── nodes/summary_nodes.py    요약 파이프라인 노드 함수
     ├── clients/agent_clients.py  hub REST 클라이언트 · Gemini 클라이언트
     └── schemas/agent_schemas.py  요청/응답 Pydantic 모델
 ```

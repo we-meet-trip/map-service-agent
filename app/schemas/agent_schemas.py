@@ -448,17 +448,23 @@ class ReviewSnippet(BaseModel):
     description: str = Field(min_length=1, max_length=500)
 
 
-class ReviewsSummaryRequest(BaseModel):
-    """`POST /v1/reviews/summary` 요청 본문.
+class SummaryPlaceRequest(BaseModel):
+    """요약 요청에 실리는 장소 한 건.
 
     place_name: 요약 대상 장소명. 프롬프트에 장소를 지목하는 데 쓴다.
     category: 분류 텍스트. 없으면 생략한다.
     reviews: 요약 근거가 될 후기 묶음. 1건도 없으면 요약할 것이 없고,
              너무 많으면 프롬프트가 비대해져 상한을 둔다.
+
+    단건 요청과 배치 요청이 같은 상한을 쓰도록 한 곳에 모아 둔다.
     """
     place_name: str = Field(min_length=1, max_length=80)
     category: Optional[str] = Field(default=None, max_length=80)
     reviews: List[ReviewSnippet] = Field(min_length=1, max_length=7)
+
+
+class ReviewsSummaryRequest(SummaryPlaceRequest):
+    """`POST /v1/reviews/summary` 요청 본문 — 장소 한 곳."""
 
 
 class ReviewsSummaryResponse(BaseModel):
@@ -468,6 +474,36 @@ class ReviewsSummaryResponse(BaseModel):
              빈 목록으로 온다 — 호출 측은 이때 요약 영역을 접는다.
     """
     bullets: List[str] = Field(default_factory=list, max_length=2)
+
+
+class ReviewsSummaryBatchRequest(BaseModel):
+    """`POST /v1/reviews/summary/batch` 요청 본문.
+
+    places: 요약 대상 장소 묶음. 한 번의 모델 호출에 담을 수 있는 만큼만
+            받는다. 목록이 더 길면 호출 측이 나눠 보낸다 — 여기서 조용히
+            잘라 내면 뒤쪽 장소가 요약을 못 받은 사실이 드러나지 않는다.
+    """
+    places: List[SummaryPlaceRequest] = Field(min_length=1, max_length=7)
+
+
+class PlaceSummaryResult(BaseModel):
+    """배치 응답의 장소 1건.
+
+    index: 요청 `places` 배열에서의 위치. 한 일정에 같은 이름이 두 번 나올
+           수 있어 이름으로는 어느 장소의 요약인지 가릴 수 없다.
+    bullets: 요약 두 줄.
+    """
+    index: int = Field(ge=0)
+    bullets: List[str] = Field(max_length=2)
+
+
+class ReviewsSummaryBatchResponse(BaseModel):
+    """`POST /v1/reviews/summary/batch` 응답 본문.
+
+    results: 두 줄을 채운 장소만 담는다. 근거를 구하지 못한 장소는 목록에서
+             빠진다 — 부분 커버리지는 오류가 아니라 정상 결과다.
+    """
+    results: List[PlaceSummaryResult] = Field(default_factory=list)
 
 
 class RouteEnvelope(BaseModel):

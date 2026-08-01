@@ -16,8 +16,9 @@ def test_defaults() -> None:
     assert s.GEMINI_RPM_LIMIT == 10
     assert s.GEMINI_RPD_LIMIT == 250
     assert s.GEMINI_RPD_CAP == 200
-    # 장소 선정 1 + 동선 1 + 추천이유 1 + 리뷰요약 1
-    assert s.GEMINI_MAX_CALLS_PER_REQUEST == 4
+    # 장소 선정 1 + 동선 1 + 추천이유 1. 블로그 요약은 추천 파이프라인에서
+    # 빠져 자기 예산(SUMMARY_MAX_LLM_CALLS)으로 돈다.
+    assert s.GEMINI_MAX_CALLS_PER_REQUEST == 3
     assert s.GEMINI_TEMPERATURE == 0.2
     assert s.GEMINI_MAX_OUTPUT_TOKENS == 8192
     assert s.GEMINI_THINKING_BUDGET == 0
@@ -44,6 +45,8 @@ def test_defaults() -> None:
     assert s.SUMMARY_ENABLED is True
     # 추천 장소 상한(7곳)과 같아야 뒷순번 장소도 요약을 받는다.
     assert s.SUMMARY_MAX_PLACES == 7
+    # 본 호출 1 + 형식 이탈 시 교정 재시도 1.
+    assert s.SUMMARY_MAX_LLM_CALLS == 2
     assert s.RULES_ENABLED is True
     assert s.LOG_LEVEL == "INFO"
 

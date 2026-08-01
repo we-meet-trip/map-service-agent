@@ -51,20 +51,19 @@ from app.clients.agent_clients import (
     StreamsPublisher,
 )
 from app.graph.agent_graph import build_graph
+from app.graph.summary_graph import SUMMARY_GRAPH
 from app.llm.rate_limit import GeminiQuotaError, GeminiRateLimiter
-from app.llm.structured_call import LLMBudgetExceeded, call_structured
-from app.nodes.agent_nodes import (
-    BULLET_LINES,
-    build_summary_prompt_from_views,
-    summary_place_view,
-)
+from app.llm.structured_call import LLMBudgetExceeded
 from app.schemas.agent_schemas import (
     AgentJobAccepted,
     AgentRequest,
-    BulletsEnvelope,
     JobDonePayload,
+    PlaceSummaryResult,
+    ReviewsSummaryBatchRequest,
+    ReviewsSummaryBatchResponse,
     ReviewsSummaryRequest,
     ReviewsSummaryResponse,
+    SummaryPlaceRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -492,6 +491,51 @@ async def recommend(
     return AgentJobAccepted(job_id=job_id)
 
 
+async def _run_summary(
+    places: list[SummaryPlaceRequest],
+) -> dict[int, list[str]]:
+    """요약 파이프라인을 한 번 돌려 요청 위치별 두 줄을 돌려준다.
+
+    두 요약 엔드포인트가 이 함수를 공유한다. 한도 초과와 그 밖의 실패를
+    가르는 기준이 두 곳으로 갈라지면 같은 원인이 경로에 따라 다른 상태로
+    나가기 때문이다.
+
+    반환: 요청 배열의 위치 → 두 줄. 근거를 못 구한 장소는 키가 없다.
+
+    실패 처리:
+      - 호출 한도에 걸리면 429. 호출 측은 요약 없이 화면을 그린다.
+      - 모델 응답이 형식을 벗어나거나 호출이 실패하면 502.
+      - 형식은 맞지만 쓸 만한 두 줄이 나오지 않으면 빈 결과. 요약이 없는
+        것은 오류가 아니라 근거가 부족한 상태다.
+    """
+    if not get_settings().SUMMARY_ENABLED:
+        logger.info("reviews summary disabled by settings")
+        return {}
+    state = {
+        "places": [
+            {
+                "name": p.place_name,
+                "category": p.category,
+                "snippets": [r.description for r in p.reviews],
+            }
+            for p in places
+        ]
+    }
+    try:
+        out = await SUMMARY_GRAPH.ainvoke(state)
+    except (LLMBudgetExceeded, GeminiQuotaError) as e:
+        logger.info("reviews summary rate limited: %s", type(e).__name__)
+        raise HTTPException(
+            status_code=429, detail="summary rate limited"
+        ) from e
+    except Exception as e:  # noqa: BLE001 — 원인은 로그로만 남긴다
+        logger.warning("reviews summary failed: %s", type(e).__name__)
+        raise HTTPException(
+            status_code=502, detail="summary unavailable"
+        ) from e
+    return out.get("bullets") or {}
+
+
 @app.post("/v1/reviews/summary", response_model=ReviewsSummaryResponse)
 async def summarize_place_reviews(
     req: ReviewsSummaryRequest,
@@ -501,9 +545,8 @@ async def summarize_place_reviews(
 ) -> ReviewsSummaryResponse:
     """장소 한 곳의 블로그 후기를 두 줄로 요약해 즉시 돌려준다.
 
-    일정 생성 파이프라인이 만드는 요약과 같은 규칙·같은 프롬프트를 쓰되,
-    잡을 만들지 않고 그 자리에서 답한다. 장소를 눌렀을 때 요약을 보여주려면
-    일정 하나를 통째로 만들 때까지 기다릴 수 없기 때문이다.
+    장소를 눌렀을 때 부르는 경로다. 미리 만들어 둔 요약이 없거나 만료됐을
+    때 그 자리에서 답한다.
 
     후기는 호출 측이 이미 받아 둔 것을 그대로 실어 보낸다. 여기서 다시
     조회하면 외부 호출이 두 배가 되고, 화면에 보이는 목록과 요약의 근거가
@@ -513,48 +556,42 @@ async def summarize_place_reviews(
       req: 장소명·분류와 요약 근거가 될 후기 묶음.
       x_internal_token: 내부 서비스 인증 헤더. 토큰이 설정된 배포에서
         부재/불일치면 401.
-
-    실패 처리:
-      - 호출 한도에 걸리면 429. 호출 측은 요약 없이 화면을 그린다.
-      - 모델 응답이 형식을 벗어나거나 호출이 실패하면 502.
-      - 형식은 맞지만 쓸 만한 두 줄이 나오지 않으면 200 에 빈 목록.
-        요약이 없는 것은 오류가 아니라 근거가 부족한 상태다.
     """
     _verify_internal_token(x_internal_token)
-    view = summary_place_view(
-        0,
-        req.place_name,
-        req.category,
-        [r.description for r in req.reviews],
-    )
-    system, prompt = build_summary_prompt_from_views([view])
-    # 잡 상태 없이 부르므로 호출 예산은 이 요청 안에서만 센다. 2 로 두어
-    # 첫 호출이 형식을 벗어났을 때 교정 재시도 한 번까지만 허용한다.
-    state: dict = {}
-    try:
-        envelope = await call_structured(
-            state,
-            prompt,
-            BulletsEnvelope,
-            system_instruction=system,
-            max_calls=2,
-        )
-    except (LLMBudgetExceeded, GeminiQuotaError) as e:
-        logger.info("reviews summary rate limited: %s", type(e).__name__)
-        raise HTTPException(
-            status_code=429, detail="summary rate limited"
-        ) from e
-    except Exception as e:  # noqa: BLE001 — 원인은 로그로만 남긴다
-        logger.warning(
-            "reviews summary failed: %s", type(e).__name__
-        )
-        raise HTTPException(
-            status_code=502, detail="summary unavailable"
-        ) from e
+    bullets = await _run_summary([req])
+    return ReviewsSummaryResponse(bullets=bullets.get(0, []))
 
-    for item in envelope.items:
-        lines = [b.strip() for b in item.bullets if b.strip()]
-        if len(lines) >= BULLET_LINES:
-            return ReviewsSummaryResponse(bullets=lines[:BULLET_LINES])
-    logger.info("reviews summary produced no usable lines")
-    return ReviewsSummaryResponse(bullets=[])
+
+@app.post(
+    "/v1/reviews/summary/batch",
+    response_model=ReviewsSummaryBatchResponse,
+)
+async def summarize_places_reviews(
+    req: ReviewsSummaryBatchRequest,
+    x_internal_token: str | None = Header(
+        default=None, alias="X-Internal-Token"
+    ),
+) -> ReviewsSummaryBatchResponse:
+    """여러 장소의 후기를 한 번에 요약한다.
+
+    일정이 만들어진 직후 그 일정의 장소를 미리 요약해 두는 경로다. 장소마다
+    따로 부르면 호출 수가 장소 수만큼 늘어 분당 상한에 걸리므로, 한 번의
+    모델 호출에 묶어 보낸다.
+
+    응답은 요청 배열의 **위치**로 짚는다. 한 일정에 같은 이름이 두 번 나올
+    수 있어 이름으로는 어느 장소의 요약인지 가릴 수 없다. 근거를 못 구한
+    장소는 결과에서 빠진다 — 부분 커버리지는 정상이다.
+
+    인자:
+      req: 요약 대상 장소 묶음.
+      x_internal_token: 내부 서비스 인증 헤더. 토큰이 설정된 배포에서
+        부재/불일치면 401.
+    """
+    _verify_internal_token(x_internal_token)
+    bullets = await _run_summary(req.places)
+    return ReviewsSummaryBatchResponse(
+        results=[
+            PlaceSummaryResult(index=index, bullets=lines)
+            for index, lines in sorted(bullets.items())
+        ]
+    )
