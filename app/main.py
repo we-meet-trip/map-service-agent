@@ -51,11 +51,20 @@ from app.clients.agent_clients import (
     StreamsPublisher,
 )
 from app.graph.agent_graph import build_graph
-from app.llm.rate_limit import GeminiRateLimiter
+from app.llm.rate_limit import GeminiQuotaError, GeminiRateLimiter
+from app.llm.structured_call import LLMBudgetExceeded, call_structured
+from app.nodes.agent_nodes import (
+    BULLET_LINES,
+    build_summary_prompt_from_views,
+    summary_place_view,
+)
 from app.schemas.agent_schemas import (
     AgentJobAccepted,
     AgentRequest,
+    BulletsEnvelope,
     JobDonePayload,
+    ReviewsSummaryRequest,
+    ReviewsSummaryResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -481,3 +490,71 @@ async def recommend(
     bg_tasks.add(task)
     task.add_done_callback(bg_tasks.discard)
     return AgentJobAccepted(job_id=job_id)
+
+
+@app.post("/v1/reviews/summary", response_model=ReviewsSummaryResponse)
+async def summarize_place_reviews(
+    req: ReviewsSummaryRequest,
+    x_internal_token: str | None = Header(
+        default=None, alias="X-Internal-Token"
+    ),
+) -> ReviewsSummaryResponse:
+    """장소 한 곳의 블로그 후기를 두 줄로 요약해 즉시 돌려준다.
+
+    일정 생성 파이프라인이 만드는 요약과 같은 규칙·같은 프롬프트를 쓰되,
+    잡을 만들지 않고 그 자리에서 답한다. 장소를 눌렀을 때 요약을 보여주려면
+    일정 하나를 통째로 만들 때까지 기다릴 수 없기 때문이다.
+
+    후기는 호출 측이 이미 받아 둔 것을 그대로 실어 보낸다. 여기서 다시
+    조회하면 외부 호출이 두 배가 되고, 화면에 보이는 목록과 요약의 근거가
+    어긋날 수 있다.
+
+    인자:
+      req: 장소명·분류와 요약 근거가 될 후기 묶음.
+      x_internal_token: 내부 서비스 인증 헤더. 토큰이 설정된 배포에서
+        부재/불일치면 401.
+
+    실패 처리:
+      - 호출 한도에 걸리면 429. 호출 측은 요약 없이 화면을 그린다.
+      - 모델 응답이 형식을 벗어나거나 호출이 실패하면 502.
+      - 형식은 맞지만 쓸 만한 두 줄이 나오지 않으면 200 에 빈 목록.
+        요약이 없는 것은 오류가 아니라 근거가 부족한 상태다.
+    """
+    _verify_internal_token(x_internal_token)
+    view = summary_place_view(
+        0,
+        req.place_name,
+        req.category,
+        [r.description for r in req.reviews],
+    )
+    system, prompt = build_summary_prompt_from_views([view])
+    # 잡 상태 없이 부르므로 호출 예산은 이 요청 안에서만 센다. 2 로 두어
+    # 첫 호출이 형식을 벗어났을 때 교정 재시도 한 번까지만 허용한다.
+    state: dict = {}
+    try:
+        envelope = await call_structured(
+            state,
+            prompt,
+            BulletsEnvelope,
+            system_instruction=system,
+            max_calls=2,
+        )
+    except (LLMBudgetExceeded, GeminiQuotaError) as e:
+        logger.info("reviews summary rate limited: %s", type(e).__name__)
+        raise HTTPException(
+            status_code=429, detail="summary rate limited"
+        ) from e
+    except Exception as e:  # noqa: BLE001 — 원인은 로그로만 남긴다
+        logger.warning(
+            "reviews summary failed: %s", type(e).__name__
+        )
+        raise HTTPException(
+            status_code=502, detail="summary unavailable"
+        ) from e
+
+    for item in envelope.items:
+        lines = [b.strip() for b in item.bullets if b.strip()]
+        if len(lines) >= BULLET_LINES:
+            return ReviewsSummaryResponse(bullets=lines[:BULLET_LINES])
+    logger.info("reviews summary produced no usable lines")
+    return ReviewsSummaryResponse(bullets=[])

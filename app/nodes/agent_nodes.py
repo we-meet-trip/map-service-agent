@@ -73,7 +73,7 @@ _REVIEW_SNIPPET_MAX = 150  # 리뷰 스니펫 뷰(외부 블로그 = 최고위�
 # 요약 품질의 근거이므로).
 _PROMPT_SNIPPET_KEEP = 2
 # 장소 카드에 실리는 요약 줄 수. 클라이언트로 나가는 개수 계약이다.
-_BULLET_LINES = 2
+BULLET_LINES = 2
 # hub 가 받는 블로그 검색어 길이 상한.
 _REVIEW_QUERY_MAX = 60
 
@@ -1544,6 +1544,40 @@ async def _reviews_for_summary(
     return out
 
 
+def summary_place_view(
+    place_id: int,
+    name: str,
+    category: str | None,
+    snippets: list[str],
+) -> dict:
+    """요약 프롬프트에 실을 장소 한 건의 새니타이즈 뷰를 만든다.
+
+    장소명·분류·후기 문자열은 모두 외부 또는 모델 유래라 그대로 넣으면
+    간접 인젝션 통로가 된다. 길이를 자르고 정화한 뷰만 프롬프트에 싣는다.
+
+    파이프라인 노드와 단건 요약 경로가 같은 뷰를 쓰도록 함수로 뽑아 둔다 —
+    두 곳이 각자 뷰를 만들면 프롬프트가 서서히 갈라진다.
+    """
+    return {
+        "place_id": place_id,
+        "name": sanitize_text(name, _PLACE_NAME_MAX),
+        "category": _sanitize_optional(category, _CAND_FIELD_MAX),
+        "review_snippets": [
+            sanitize_text(s, _REVIEW_SNIPPET_MAX) for s in snippets
+        ],
+    }
+
+
+def build_summary_prompt_from_views(views: list[dict]) -> tuple[str, str]:
+    """장소 뷰 목록으로 요약 프롬프트를 조립한다.
+
+    반환: `(system_instruction, user_content)` 튜플
+    (system 은 `_SUMMARY_SYSTEM` 불변 규칙).
+    """
+    places_json = json.dumps(views, ensure_ascii=False)
+    return _SUMMARY_SYSTEM, f"<places>{places_json}</places>\n"
+
+
 def _build_summary_prompt(
     places: list[Place], snippets: dict[int, list[str]]
 ) -> tuple[str, str]:
@@ -1558,20 +1592,13 @@ def _build_summary_prompt(
     `_REVIEW_SNIPPET_MAX` 로 절단한 새니타이즈 뷰만 쓴다.
     """
     place_view = [
-        {
-            "place_id": p.place_id,
-            "name": sanitize_text(p.name, _PLACE_NAME_MAX),
-            "category": _sanitize_optional(p.category, _CAND_FIELD_MAX),
-            "review_snippets": [
-                sanitize_text(s, _REVIEW_SNIPPET_MAX)
-                for s in snippets.get(p.place_id, [])
-            ],
-        }
+        summary_place_view(
+            p.place_id, p.name, p.category, snippets.get(p.place_id, [])
+        )
         for p in places
         if snippets.get(p.place_id)
     ]
-    places_json = json.dumps(place_view, ensure_ascii=False)
-    return _SUMMARY_SYSTEM, f"<places>{places_json}</places>\n"
+    return build_summary_prompt_from_views(place_view)
 
 
 async def summarize_reviews(state: AgentState) -> AgentState:
@@ -1635,9 +1662,9 @@ async def summarize_reviews(state: AgentState) -> AgentState:
         # 남는 줄은 잘라 낸다 — 한 장소의 형식 이탈이 나머지 장소의 요약까지
         # 없애지 않도록 항목 단위로 처리한다.
         lines = [b.strip() for b in item.bullets if b.strip()]
-        if len(lines) < _BULLET_LINES:
+        if len(lines) < BULLET_LINES:
             continue
-        collected[item.place_id] = lines[:_BULLET_LINES]
+        collected[item.place_id] = lines[:BULLET_LINES]
     if collected:
         state["summaries"] = collected
     else:

@@ -434,6 +434,42 @@ class BulletsEnvelope(BaseModel):
     items: List[PlaceBullets]
 
 
+class ReviewSnippet(BaseModel):
+    """요약 요청에 실려 오는 블로그 후기 한 건.
+
+    호출 측이 이미 받아 둔 후기를 그대로 넘겨준다. 여기서 다시 조회하지
+    않는 이유는, 같은 후기를 두 번 받으면 외부 호출이 두 배가 되고 화면에
+    보이는 목록과 요약의 근거가 어긋날 수 있기 때문이다.
+
+    title: 글 제목. 없어도 되지만 있으면 요약 품질에 도움이 된다.
+    description: 본문 발췌. 요약의 실질적 근거다.
+    """
+    title: str = Field(default="", max_length=200)
+    description: str = Field(min_length=1, max_length=500)
+
+
+class ReviewsSummaryRequest(BaseModel):
+    """`POST /v1/reviews/summary` 요청 본문.
+
+    place_name: 요약 대상 장소명. 프롬프트에 장소를 지목하는 데 쓴다.
+    category: 분류 텍스트. 없으면 생략한다.
+    reviews: 요약 근거가 될 후기 묶음. 1건도 없으면 요약할 것이 없고,
+             너무 많으면 프롬프트가 비대해져 상한을 둔다.
+    """
+    place_name: str = Field(min_length=1, max_length=80)
+    category: Optional[str] = Field(default=None, max_length=80)
+    reviews: List[ReviewSnippet] = Field(min_length=1, max_length=7)
+
+
+class ReviewsSummaryResponse(BaseModel):
+    """`POST /v1/reviews/summary` 응답 본문.
+
+    bullets: 요약 두 줄. 근거가 부족하거나 모델 응답이 형식을 벗어나면
+             빈 목록으로 온다 — 호출 측은 이때 요약 영역을 접는다.
+    """
+    bullets: List[str] = Field(default_factory=list, max_length=2)
+
+
 class RouteEnvelope(BaseModel):
     """`recommend_route` 단계에서 LLM 이 돌려주는 구조화 응답의 루트.
 
