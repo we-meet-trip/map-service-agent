@@ -184,6 +184,30 @@ def test_reviews_missing_hub_returns_empty() -> None:
     assert reviews == {}
 
 
+def test_review_query_is_prefixed_with_region() -> None:
+    """검색어에 지역을 붙여 같은 이름의 다른 지역 가게를 걸러 낸다."""
+    from datetime import date, time
+
+    from app.nodes.agent_nodes import _review_query
+    from app.schemas.agent_schemas import AgentRequest, DateRange
+
+    state = {
+        "request": AgentRequest(
+            date=DateRange(
+                date_start=date(2026, 7, 6),
+                date_end=date(2026, 7, 6),
+                time_start=time(9, 0),
+                time_end=time(18, 0),
+            ),
+            province="서울특별시",
+            city="강남구",
+        )
+    }
+    assert _review_query(state, "이스트커피") == "강남구 이스트커피"
+    # hub 가 받는 길이 상한을 넘기면 조회 자체가 실패하므로 잘라 낸다.
+    assert len(_review_query(state, "가" * 80)) == 60
+
+
 def test_reviews_fetch_failure_skips_candidate() -> None:
     """fetch_reviews 예외는 해당 후보를 건너뛴다(잡 실패 아님)."""
     deps.set_hub_client(_ReviewHub(exc=httpx.ConnectError("down")))

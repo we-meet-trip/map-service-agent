@@ -78,10 +78,9 @@ class Mobility(str, Enum):
 
     walk: 도보.
     bicycle: 자전거.
-    scooter: 전동 킥보드. SoT(def §3.6)의 kickboard 와 같은 개념이며,
-        hub 룰이 두 철자를 모두 받아 반경 7km 를 적용한다. 예전에는 이 값이
-        없어 BFF 가 킥보드를 bicycle 로 치환했고, 그 결과 킥보드 전용 반경이
-        한 번도 적용되지 않았다.
+    scooter: 전동 킥보드. kickboard 와 같은 개념이며 hub 룰이 두 철자를 모두
+        받는다. 반경은 자전거와 같지만 소요시간 보정 계수와 경로 프로파일이
+        달라, bicycle 로 치환하지 않고 별도 값으로 전달해야 한다.
     car: 자가용/택시 등 자동차.
     transit: 대중교통(버스/지하철 등).
 
@@ -168,7 +167,7 @@ class AgentRequest(BaseModel):
     mobility: 선호 이동 수단(`Mobility`). 없을 수 있음.
     province: 광역 행정구역(예: "서울특별시"). 1~20자.
     city: 시/군/구(예: "강남구"). 1~20자.
-    schedule_id: user-BFF 의 일정 식별자(SoT §6.1 B2 body). 추적/영속화
+    schedule_id: user-BFF 의 일정 식별자. 추적/영속화
                  연계용 패스스루 — agent 는 user_service 스키마를 읽지
                  않으므로 이 값으로 조회하지 않는다. nullable.
     stage: 추천 단계.
@@ -282,7 +281,7 @@ class Place(BaseModel):
     route_idx: Optional[str] = None
     # 외부 실측 후보에 근거해 만든 장소면 True, LLM 단독 생성이면 False.
     grounded: bool = True
-    # llm_reason 노드가 병합하는 장소별 추천 이유(SoT §3 agent 책임).
+    # llm_reason 노드가 병합하는 장소별 추천 이유.
     # LLM 응답(ReasonEnvelope)에서 검증을 거친 값만 들어온다. 생성
     # 시점에는 없다가 build_payload 에서 model_copy 로 채워진다.
     reason: Optional[str] = Field(default=None, max_length=200)
@@ -432,6 +431,78 @@ class BulletsEnvelope(BaseModel):
         `response_schema` (summarize_reviews 노드, LLM 4번째 호출).
     """
     items: List[PlaceBullets]
+
+
+class ReviewSnippet(BaseModel):
+    """요약 요청에 실려 오는 블로그 후기 한 건.
+
+    호출 측이 이미 받아 둔 후기를 그대로 넘겨준다. 여기서 다시 조회하지
+    않는 이유는, 같은 후기를 두 번 받으면 외부 호출이 두 배가 되고 화면에
+    보이는 목록과 요약의 근거가 어긋날 수 있기 때문이다.
+
+    title: 글 제목. 없어도 되지만 있으면 요약 품질에 도움이 된다.
+    description: 본문 발췌. 요약의 실질적 근거다.
+    """
+    title: str = Field(default="", max_length=200)
+    description: str = Field(min_length=1, max_length=500)
+
+
+class SummaryPlaceRequest(BaseModel):
+    """요약 요청에 실리는 장소 한 건.
+
+    place_name: 요약 대상 장소명. 프롬프트에 장소를 지목하는 데 쓴다.
+    category: 분류 텍스트. 없으면 생략한다.
+    reviews: 요약 근거가 될 후기 묶음. 1건도 없으면 요약할 것이 없고,
+             너무 많으면 프롬프트가 비대해져 상한을 둔다.
+
+    단건 요청과 배치 요청이 같은 상한을 쓰도록 한 곳에 모아 둔다.
+    """
+    place_name: str = Field(min_length=1, max_length=80)
+    category: Optional[str] = Field(default=None, max_length=80)
+    reviews: List[ReviewSnippet] = Field(min_length=1, max_length=7)
+
+
+class ReviewsSummaryRequest(SummaryPlaceRequest):
+    """`POST /v1/reviews/summary` 요청 본문 — 장소 한 곳."""
+
+
+class ReviewsSummaryResponse(BaseModel):
+    """`POST /v1/reviews/summary` 응답 본문.
+
+    bullets: 요약 두 줄. 근거가 부족하거나 모델 응답이 형식을 벗어나면
+             빈 목록으로 온다 — 호출 측은 이때 요약 영역을 접는다.
+    """
+    bullets: List[str] = Field(default_factory=list, max_length=2)
+
+
+class ReviewsSummaryBatchRequest(BaseModel):
+    """`POST /v1/reviews/summary/batch` 요청 본문.
+
+    places: 요약 대상 장소 묶음. 한 번의 모델 호출에 담을 수 있는 만큼만
+            받는다. 목록이 더 길면 호출 측이 나눠 보낸다 — 여기서 조용히
+            잘라 내면 뒤쪽 장소가 요약을 못 받은 사실이 드러나지 않는다.
+    """
+    places: List[SummaryPlaceRequest] = Field(min_length=1, max_length=7)
+
+
+class PlaceSummaryResult(BaseModel):
+    """배치 응답의 장소 1건.
+
+    index: 요청 `places` 배열에서의 위치. 한 일정에 같은 이름이 두 번 나올
+           수 있어 이름으로는 어느 장소의 요약인지 가릴 수 없다.
+    bullets: 요약 두 줄.
+    """
+    index: int = Field(ge=0)
+    bullets: List[str] = Field(max_length=2)
+
+
+class ReviewsSummaryBatchResponse(BaseModel):
+    """`POST /v1/reviews/summary/batch` 응답 본문.
+
+    results: 두 줄을 채운 장소만 담는다. 근거를 구하지 못한 장소는 목록에서
+             빠진다 — 부분 커버리지는 오류가 아니라 정상 결과다.
+    """
+    results: List[PlaceSummaryResult] = Field(default_factory=list)
 
 
 class RouteEnvelope(BaseModel):

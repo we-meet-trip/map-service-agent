@@ -10,26 +10,29 @@
   -> rules_filter -> score_and_rank      (hub /v1/rules/*)
   -> recommend_places -> recommend_route
   -> llm_reason                          (정상 경로 한정, 실패 시 degrade)
-  -> summarize_reviews                   (정상 경로 한정, 실패 시 degrade)
   -> build_payload -> publish_done
+
+블로그 후기 요약은 이 그래프에 없다. 요약은 일정에 딸려 나오는 값이 아니라
+장소를 눌렀을 때 필요한 정보이므로 별도 파이프라인
+(`app/graph/summary_graph.py`)이 맡는다.
 
 stage="route" 분기:
   사용자가 방문지를 이미 골라 온 요청은 탐색·선정 구간이 통째로 불필요하다.
   fetch_weather 다음에서 갈라져 load_given_places 로 장소를 세운 뒤 곧장
   recommend_route 에 합류한다(이후 구간은 공용). LLM 호출은 동선 1 + 이유 1
-  + 요약 1 로 초기 추천보다 1회 적다.
+  로 초기 추천보다 1회 적다.
 
 에러 라우팅 (`_route_after`):
   parse_input / fetch_weather / recommend_places / recommend_route 중
   어느 노드든 `state["error"]` 를 설정하면 후속 노드를 건너뛰고
-  `build_payload` 로 단축 분기한다. llm_reason 과 summarize_reviews 는
-  error 를 만들지 않는 enhancement 노드(실패 시 degrade)이므로, 그
-  뒤는 단순 엣지로 `build_payload` 에 수렴한다. `publish_done` 은 항상
-  호출되어 성공/실패 한쪽 `JobDonePayload` 를 Redis Streams 에 게시한다.
+  `build_payload` 로 단축 분기한다. llm_reason 은 error 를 만들지 않는
+  enhancement 노드(실패 시 degrade)이므로, 그 뒤는 단순 엣지로
+  `build_payload` 에 수렴한다. `publish_done` 은 항상 호출되어 성공/실패
+  한쪽 `JobDonePayload` 를 Redis Streams 에 게시한다.
   (각 노드도 `state["error"]` 를 보고 자체 no-op 하므로, 단축 분기는
   불필요한 LLM/HTTP 호출을 줄이는 최적화다.)
 
-체크포인터 (SoT B5):
+체크포인터:
   `build_graph(checkpointer=...)` 로 주입한다. None 이면 체크포인트 없이
   컴파일한다(단위 테스트·CHECKPOINT_ENABLED=false). 주입 시 `_run_job`
   은 `config={"configurable": {"thread_id": job_id}}` 로 invoke 해야 한다.
@@ -51,7 +54,6 @@ from app.nodes.agent_nodes import (
     rules_filter,
     score_and_rank,
     search_places,
-    summarize_reviews,
 )
 
 
@@ -89,7 +91,6 @@ def build_graph(checkpointer=None):
     graph.add_node("recommend_places", recommend_places)
     graph.add_node("recommend_route", recommend_route)
     graph.add_node("llm_reason", llm_reason)
-    graph.add_node("summarize_reviews", summarize_reviews)
     graph.add_node("build_payload", build_payload)
     graph.add_node("publish_done", publish_done)
 
@@ -142,10 +143,9 @@ def build_graph(checkpointer=None):
             "build_payload": "build_payload",
         },
     )
-    # 두 enhancement 노드는 직렬이다 — 요약 노드가 llm_reason 이 남긴
-    # 예산 잔량을 보고 자기 호출 여부를 정하므로 순서가 의미를 갖는다.
-    graph.add_edge("llm_reason", "summarize_reviews")
-    graph.add_edge("summarize_reviews", "build_payload")
+    # llm_reason 은 실패해도 error 를 세우지 않고 저하 표시만 남기므로
+    # 단순 엣지로 합류 지점까지 직진한다.
+    graph.add_edge("llm_reason", "build_payload")
     graph.add_edge("build_payload", "publish_done")
     graph.add_edge("publish_done", END)
     return graph.compile(checkpointer=checkpointer)

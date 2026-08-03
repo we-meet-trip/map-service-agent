@@ -220,16 +220,14 @@ def test_load_given_places_noop_on_error() -> None:
 # ── 그래프 통합 ────────────────────────────────────────────────
 
 def test_route_stage_skips_search_and_selection() -> None:
-    """장소 탐색을 부르지 않고 LLM 은 동선·이유·요약 3회만 쓴다."""
+    """장소 탐색을 부르지 않고 LLM 은 동선·이유 2회만 쓴다."""
     hub = _FakeHub()
-    gemini = _SeqGemini([
-        _route_envelope(2), _reason_envelope(2), _bullets_envelope(2),
-    ])
+    gemini = _SeqGemini([_route_envelope(2), _reason_envelope(2)])
 
     out, pub = _invoke(_request(), hub, gemini)
 
     assert hub.search_calls == 0
-    assert gemini.calls == 3
+    assert gemini.calls == 2
     assert out.get("error") is None
     payload = pub.payloads[0]
     assert payload["status"] == "done"
@@ -238,22 +236,21 @@ def test_route_stage_skips_search_and_selection() -> None:
     ]
     assert payload["visit_order"] == [0, 1]
     assert len(payload["legs"]) == 1
-    # 이유와 요약은 초기 추천과 같은 방식으로 붙는다.
+    # 추천 이유는 초기 추천과 같은 방식으로 붙는다. 블로그 요약은 이 경로에
+    # 실리지 않는다 — 장소를 눌렀을 때 별도 파이프라인이 만든다.
     assert payload["places"][0]["reason"] == "이유0"
-    assert payload["places"][0]["bullets"] == ["요약0-1", "요약0-2"]
+    assert payload["places"][0]["bullets"] is None
 
 
 def test_route_stage_stays_within_llm_budget() -> None:
-    """route 경로의 LLM 소비는 예산 상한보다 작다(요약까지 포함해 3회)."""
+    """route 경로의 LLM 소비는 예산 상한보다 작다(동선·이유 2회)."""
     from app.agent_settings import get_settings
 
     hub = _FakeHub()
-    gemini = _SeqGemini([
-        _route_envelope(2), _reason_envelope(2), _bullets_envelope(2),
-    ])
+    gemini = _SeqGemini([_route_envelope(2), _reason_envelope(2)])
     out, _ = _invoke(_request(), hub, gemini)
 
-    assert out["llm_calls_used"] == 3
+    assert out["llm_calls_used"] == 2
     assert out["llm_calls_used"] <= get_settings().GEMINI_MAX_CALLS_PER_REQUEST
 
 

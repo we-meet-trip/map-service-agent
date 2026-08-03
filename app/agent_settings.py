@@ -23,19 +23,20 @@ class AgentSettings(BaseSettings):
       GEMINI_API_KEY: 비밀값(SecretStr). 기본 빈 문자열.
                       lifespan 진입 시 비어 있으면 RuntimeError 로 부팅 중단.
       GEMINI_MODEL: 모델 이름 문자열. GeminiClient 생성 시 전달.
-      GEMINI_RPM_LIMIT: 분당 호출 상한(외부 API 한도, SoT §10). token-bucket
+      GEMINI_RPM_LIMIT: 분당 호출 상한(외부 API 가 정한 값). token-bucket
                         용량/리필률로 사용된다.
-      GEMINI_RPD_LIMIT: 일일 호출 상한(외부 API 한도 250, 문서화 목적).
+      GEMINI_RPD_LIMIT: 외부 API 의 일일 상한(250, 문서화 목적).
                         실제 집행은 GEMINI_RPD_CAP 이 담당한다.
-      GEMINI_RPD_CAP: agent 자체 일일 상한(SoT R-01: 200/일, 50은 데모 예비).
+      GEMINI_RPD_CAP: agent 자체 일일 상한(200/일). 외부 한도보다 낮게 잡아
+                      50 회를 수동 점검·데모용 예비로 남긴다.
                       GeminiRateLimiter 의 일일 카운터가 KST 자정 기준으로
                       집행한다.
       GEMINI_MAX_CALLS_PER_REQUEST: 추천 요청 1건당 LLM 호출 하드 예산.
                       교정 재시도 포함 모든 호출이 본 예산을 소비한다.
                       정상 경로 소비 내역: 장소 선정 1 + 동선 1 +
-                      추천이유 1 + 리뷰요약 1 = 4. SUMMARY_ENABLED=false
-                      면 요약 노드가 예산을 쓰지 않으므로 실질 3회로
-                      줄어든다.
+                      추천이유 1 = 3. 블로그 요약은 추천 파이프라인에서
+                      빠져 별도 파이프라인이 자기 예산
+                      (SUMMARY_MAX_LLM_CALLS)으로 돈다.
       GEMINI_TEMPERATURE: 생성 온도. 구조화 출력의 결정성을 위해 낮게 둔다.
       GEMINI_MAX_OUTPUT_TOKENS: 응답 토큰 상한. Gemini 2.5 계열은 thinking
                       토큰이 본 상한을 함께 소비하므로 과소 설정 시 JSON 이
@@ -100,24 +101,28 @@ class AgentSettings(BaseSettings):
       REVIEWS_MAX_PLACES: 선정 단계에서 리뷰를 조회할 상위 후보 수.
                      랭킹 상위 K 개에만 조회해 hub 왕복을 억제한다.
       REVIEWS_DISPLAY: 후보 1건당 hub 에 요청하는 리뷰 수(display).
-                     요약이 여러 글을 교차 대조할 수 있도록 5로 둔다.
-                     프롬프트 뷰는 이 중 앞 2건만 쓰고(토큰 절약), 요약
-                     노드가 전량을 근거로 쓴다.
+                     여러 글을 교차 대조할 수 있도록 5로 둔다. 선정·이유
+                     프롬프트 뷰는 이 중 앞 2건만 쓴다(토큰 절약).
       REVIEWS_FETCH_CAP_PER_JOB: 잡 1건이 hub `/v1/reviews` 를 호출할 총
-                     상한. 선정 단계와 요약 단계가 이 예산을 공유하며,
-                     요약 단계는 남은 만큼만 추가 조회한다 — 장소 수에
-                     비례해 외부 API 호출이 무한히 늘어나는 것을 막되,
-                     모든 추천 장소가 요약을 받을 수 있는 여유는 남긴다.
-                     hub 가 6시간 캐시를 두므로 같은 장소 재조회는
-                     외부 API 호출로 이어지지 않는다.
+                     상한. 선정 단계가 상위 후보만 조회하므로 실제로는
+                     여유가 남는 안전망이다 — 장소 수에 비례해 외부 API
+                     호출이 무한히 늘어나는 것을 막는다. hub 가 6시간
+                     캐시를 두므로 같은 장소 재조회는 외부 API 호출로
+                     이어지지 않는다.
 
-    블로그 요약(summarize_reviews) 관련:
-      SUMMARY_ENABLED: True(기본)면 llm_reason 다음에 summarize_reviews 가
-                     장소별 요약 2줄(bullets)을 만든다. False 면 노드가
-                     no-op 으로 통과하고 LLM 예산도 3콜 체제로 되돌아간다
-                     (kill-switch — 쿼터 압박·품질 회귀 시 즉시 무력화).
-      SUMMARY_MAX_PLACES: 요약을 만들 최대 장소 수. 프롬프트에 실리는
-                     스니펫 총량(장소 수 × REVIEWS_DISPLAY)의 상한이다.
+    블로그 요약 파이프라인 관련:
+      SUMMARY_ENABLED: True(기본)면 요약 엔드포인트가 파이프라인을 돌려
+                     장소별 요약 2줄(bullets)을 만든다. False 면 파이프라인을
+                     부르지 않고 빈 결과를 돌려준다(kill-switch — 쿼터
+                     압박·품질 회귀 시 즉시 무력화). 빈 요약은 호출 측이
+                     캐시하지 않으므로 되돌리면 즉시 정상 동작한다.
+      SUMMARY_MAX_PLACES: 한 번에 요약할 최대 장소 수. 프롬프트에 실리는
+                     스니펫 총량의 운영 상한이며, 요청 스키마의 상한과
+                     별개로 배포 없이 낮출 수 있는 조절값이다.
+      SUMMARY_MAX_LLM_CALLS: 요약 요청 1건당 LLM 호출 예산. 본 호출 1회 +
+                     응답이 형식을 벗어났을 때의 교정 재시도 1회로 2를
+                     둔다. 추천 파이프라인의 예산과 분리돼 있어 요약이
+                     추천 잡의 호출 여유를 잠식하지 않는다.
 
     룰 엔진(hub `/v1/rules/*`) 관련:
       RULES_ENABLED: True(기본)면 rules_filter/score_and_rank 가 hub 룰
@@ -127,31 +132,29 @@ class AgentSettings(BaseSettings):
 
     Redis Streams 관련:
       REDIS_URL: redis 접속 URL.
-      REDIS_DB_STREAMS: streams 발행용 DB 번호(논리적 분리).
-                        user-service 컨슈머(redis.db-streams, 기본 2)와
-                        일치해야 한다. SoT §8.3 은 DB3 로 표기하나 실측
-                        양측 합의값은 DB2 — amendment 로 SoT 정정 예정
-                        (사용자 결정 2026-07-05).
+      REDIS_DB_STREAMS: streams 발행용 DB 번호(논리적 분리). 기본 2.
+                        user-service 컨슈머(redis.db-streams)와 반드시
+                        같은 값이어야 한다 — 어긋나면 발행은 성공하는데
+                        소비자가 영원히 빈 stream 을 읽는다.
       STREAM_NAME: 잡 완료 페이로드를 발행할 stream 이름.
       STREAM_MAXLEN: 0 보다 크면 XADD 시 approximate trim 으로 stream
                      길이를 본 값 근처로 제한한다(메모리 무한 누적 방지).
       STATUS_STREAM_NAME: 노드 진행 이벤트를 발행할 stream 이름
-                          (SoT §4.5 `agent:jobs:status`). done 스트림과
-                          동일 DB(REDIS_DB_STREAMS)에 둔다.
+                          (`agent:jobs:status`). done 스트림과 동일
+                          DB(REDIS_DB_STREAMS)에 둔다.
       STATUS_STREAM_MAXLEN: status stream 의 approximate trim 상한.
       REDIS_DB_RATELIMIT: Gemini token-bucket/일일 카운터 전용 DB 번호
-                          (SoT §8.3 DB3: rate-limit 정책 그룹).
+                          (기본 3 — rate-limit 정책 키를 한 DB 에 모은다).
 
     LangGraph 체크포인터(Postgres) 관련:
       CHECKPOINT_ENABLED: True 면 lifespan 이 Postgres 체크포인터를
-                          배선한다(SoT B5). 연결 실패 시 부팅 중단
-                          (fail-fast, 사용자 결정 2026-07-05).
+                          배선한다. 연결 실패 시 부팅 중단(fail-fast).
                           False 면 체크포인터 없이 compile.
       POSTGRES_HOST / POSTGRES_PORT / POSTGRES_DB / POSTGRES_USER:
                           체크포인터 접속 정보.
       POSTGRES_PASSWORD: 비밀값(SecretStr).
       LANGGRAPH_SCHEMA: 체크포인트 테이블이 거주할 schema 이름
-                        (SoT §8.1: `langgraph`, agent 전용).
+                        (`langgraph`, agent 전용).
 
     잡 타이밍:
       JOB_TIMEOUT_SECONDS: 잡 1건의 전체 실행 한도. `_run_job` 의
@@ -161,7 +164,8 @@ class AgentSettings(BaseSettings):
                            GEMINI_TIMEOUT_SECONDS=100s) 는 이론최악이나,
                            본 wall-clock 캡이 잡 전체를 300s 에서 강제
                            종료하므로 300s 를 넘지 않는다. 정상 경로는
-                           수십 초 내 완료. SoT B2 예산(10분=600s) 내.
+                           수십 초 내 완료. BFF 가 허용하는 잡 대기
+                           상한(10분) 안에 들어온다.
       GEMINI_TIMEOUT_SECONDS: Gemini 호출 1건의 한도. GeminiClient 내부
                               `generate_text` / `generate_structured` 가
                               `asyncio.wait_for` 로 강제.
@@ -185,7 +189,7 @@ class AgentSettings(BaseSettings):
     GEMINI_RPM_LIMIT: int = 10
     GEMINI_RPD_LIMIT: int = 250
     GEMINI_RPD_CAP: int = 200
-    GEMINI_MAX_CALLS_PER_REQUEST: int = 4
+    GEMINI_MAX_CALLS_PER_REQUEST: int = 3
     GEMINI_TEMPERATURE: float = 0.2
     GEMINI_MAX_OUTPUT_TOKENS: int = 8192
     GEMINI_THINKING_BUDGET: int = 0
@@ -203,14 +207,16 @@ class AgentSettings(BaseSettings):
     REVIEWS_ENRICH_ENABLED: bool = True
     REVIEWS_MAX_PLACES: int = 3
     REVIEWS_DISPLAY: int = 5  # hub 가 받는 상한은 10
-    # 선정 단계 3회 + 요약 단계가 남은 장소를 채울 여지. 추천 장소가 최대
-    # 7곳이고 선정 단계 조회분과 겹치지 않을 수 있어 7+3 을 상한으로 둔다.
+    # 선정 단계는 상위 후보(REVIEWS_MAX_PLACES)만 조회하므로 실제 소비는 이
+    # 값에 한참 못 미친다. 장소 수에 비례해 호출이 늘어나지 않게 막는 안전망.
     REVIEWS_FETCH_CAP_PER_JOB: int = 10
 
     SUMMARY_ENABLED: bool = True
-    # 추천 장소 수 상한(프롬프트가 5~7곳을 지시)과 맞춘다. 이 값이 더 작으면
-    # 뒷순번 장소는 구조적으로 요약을 못 받는다.
+    # 한 요청에 담을 장소 수 상한. 요청 스키마의 상한과 같은 값으로 두되,
+    # 배포 없이 낮출 수 있도록 설정으로 분리해 둔다.
     SUMMARY_MAX_PLACES: int = 7
+    # 본 호출 1 + 형식 이탈 시 교정 재시도 1.
+    SUMMARY_MAX_LLM_CALLS: int = 2
 
     RULES_ENABLED: bool = True  # kill-switch — 장애 시 no-op 복귀
 

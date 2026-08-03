@@ -3,6 +3,6 @@
   - `rate_limit`     : Gemini token-bucket(RPM) + 일일 카운터(RPD cap).
   - `structured_call`: 요청당 호출 예산 집행 + 교정 재시도 헬퍼.
 
-GeminiClient(전송)와 노드(비즈니스 로직) 사이에서 SoT §10.2·R-01·§2.3 의
-호출 한도 정책을 강제한다.
+GeminiClient(전송)와 노드(비즈니스 로직) 사이에서 분당·일일·요청당 세 축의
+호출 한도를 강제한다.
 """
