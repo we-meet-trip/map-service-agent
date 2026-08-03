@@ -150,7 +150,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stream=settings.STREAM_NAME,
         maxlen=settings.STREAM_MAXLEN,
     )
-    # 진행 이벤트(agent:jobs:status, SoT §4.5) 전용 발행자. done 스트림과
+    # 진행 이벤트(agent:jobs:status) 전용 발행자. done 스트림과
     # 동일 DB 에 둔다. 소비자는 후속 주차(user-BFF progress) — 발행만 한다.
     status_streams = StreamsPublisher(
         redis_url=settings.REDIS_URL,
@@ -158,7 +158,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stream=settings.STATUS_STREAM_NAME,
         maxlen=settings.STATUS_STREAM_MAXLEN,
     )
-    # Gemini 호출 한도 집행기(SoT §10.2·R-01). GeminiClient 가 generate
+    # Gemini 호출 한도 집행기. GeminiClient 가 generate
     # 직전 acquire() 로 소비하며, RPM/RPD 초과 시 GeminiQuotaError 로
     # 잡이 실패 페이로드(gemini_rpm_exceeded / gemini_rpd_exceeded)를 낸다.
     limiter = GeminiRateLimiter(
@@ -187,7 +187,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     set_status_publisher(status_streams)
     set_gemini_client(gemini)
 
-    # LangGraph Postgres 체크포인터 (SoT B5, schema=langgraph).
+    # LangGraph Postgres 체크포인터 (schema=langgraph).
     # CHECKPOINT_ENABLED=true 인데 연결/스키마 준비가 실패하면 부팅을
     # 중단한다(fail-fast — GEMINI_API_KEY 부재와 동일 패턴, 사용자 결정
     # 2026-07-05). 관련 모듈은 지연 import 한다 — 로컬 단위 테스트
@@ -317,7 +317,7 @@ Instrumentator().instrument(app).expose(
 
 
 def _verify_internal_token(provided: str | None) -> None:
-    """B2 인바운드 요청의 `X-Internal-Token` 을 검증한다 (SoT §5.5).
+    """B2 인바운드 요청의 `X-Internal-Token` 을 검증한다.
 
     - `INTERNAL_SERVICE_TOKEN` 이 설정된 경우: 헤더 부재 또는 불일치 시
       401. 비교는 `hmac.compare_digest` 로 상수 시간 수행.
@@ -456,7 +456,7 @@ async def recommend(
 
     인자:
       req: 요청 본문. `AgentRequest` 스키마.
-      x_internal_token: B2 내부 서비스 인증 헤더(SoT §5.5). 토큰이
+      x_internal_token: B2 내부 서비스 인증 헤더. 토큰이
         설정된 배포에서 부재/불일치면 401.
 
     동작:

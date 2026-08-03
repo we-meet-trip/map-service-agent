@@ -23,11 +23,12 @@ class AgentSettings(BaseSettings):
       GEMINI_API_KEY: 비밀값(SecretStr). 기본 빈 문자열.
                       lifespan 진입 시 비어 있으면 RuntimeError 로 부팅 중단.
       GEMINI_MODEL: 모델 이름 문자열. GeminiClient 생성 시 전달.
-      GEMINI_RPM_LIMIT: 분당 호출 상한(외부 API 한도, SoT §10). token-bucket
+      GEMINI_RPM_LIMIT: 분당 호출 상한(외부 API 가 정한 값). token-bucket
                         용량/리필률로 사용된다.
-      GEMINI_RPD_LIMIT: 일일 호출 상한(외부 API 한도 250, 문서화 목적).
+      GEMINI_RPD_LIMIT: 외부 API 의 일일 상한(250, 문서화 목적).
                         실제 집행은 GEMINI_RPD_CAP 이 담당한다.
-      GEMINI_RPD_CAP: agent 자체 일일 상한(SoT R-01: 200/일, 50은 데모 예비).
+      GEMINI_RPD_CAP: agent 자체 일일 상한(200/일). 외부 한도보다 낮게 잡아
+                      50 회를 수동 점검·데모용 예비로 남긴다.
                       GeminiRateLimiter 의 일일 카운터가 KST 자정 기준으로
                       집행한다.
       GEMINI_MAX_CALLS_PER_REQUEST: 추천 요청 1건당 LLM 호출 하드 예산.
@@ -131,31 +132,29 @@ class AgentSettings(BaseSettings):
 
     Redis Streams 관련:
       REDIS_URL: redis 접속 URL.
-      REDIS_DB_STREAMS: streams 발행용 DB 번호(논리적 분리).
-                        user-service 컨슈머(redis.db-streams, 기본 2)와
-                        일치해야 한다. SoT §8.3 은 DB3 로 표기하나 실측
-                        양측 합의값은 DB2 — amendment 로 SoT 정정 예정
-                        (사용자 결정 2026-07-05).
+      REDIS_DB_STREAMS: streams 발행용 DB 번호(논리적 분리). 기본 2.
+                        user-service 컨슈머(redis.db-streams)와 반드시
+                        같은 값이어야 한다 — 어긋나면 발행은 성공하는데
+                        소비자가 영원히 빈 stream 을 읽는다.
       STREAM_NAME: 잡 완료 페이로드를 발행할 stream 이름.
       STREAM_MAXLEN: 0 보다 크면 XADD 시 approximate trim 으로 stream
                      길이를 본 값 근처로 제한한다(메모리 무한 누적 방지).
       STATUS_STREAM_NAME: 노드 진행 이벤트를 발행할 stream 이름
-                          (SoT §4.5 `agent:jobs:status`). done 스트림과
-                          동일 DB(REDIS_DB_STREAMS)에 둔다.
+                          (`agent:jobs:status`). done 스트림과 동일
+                          DB(REDIS_DB_STREAMS)에 둔다.
       STATUS_STREAM_MAXLEN: status stream 의 approximate trim 상한.
       REDIS_DB_RATELIMIT: Gemini token-bucket/일일 카운터 전용 DB 번호
-                          (SoT §8.3 DB3: rate-limit 정책 그룹).
+                          (기본 3 — rate-limit 정책 키를 한 DB 에 모은다).
 
     LangGraph 체크포인터(Postgres) 관련:
       CHECKPOINT_ENABLED: True 면 lifespan 이 Postgres 체크포인터를
-                          배선한다(SoT B5). 연결 실패 시 부팅 중단
-                          (fail-fast, 사용자 결정 2026-07-05).
+                          배선한다. 연결 실패 시 부팅 중단(fail-fast).
                           False 면 체크포인터 없이 compile.
       POSTGRES_HOST / POSTGRES_PORT / POSTGRES_DB / POSTGRES_USER:
                           체크포인터 접속 정보.
       POSTGRES_PASSWORD: 비밀값(SecretStr).
       LANGGRAPH_SCHEMA: 체크포인트 테이블이 거주할 schema 이름
-                        (SoT §8.1: `langgraph`, agent 전용).
+                        (`langgraph`, agent 전용).
 
     잡 타이밍:
       JOB_TIMEOUT_SECONDS: 잡 1건의 전체 실행 한도. `_run_job` 의
@@ -165,7 +164,8 @@ class AgentSettings(BaseSettings):
                            GEMINI_TIMEOUT_SECONDS=100s) 는 이론최악이나,
                            본 wall-clock 캡이 잡 전체를 300s 에서 강제
                            종료하므로 300s 를 넘지 않는다. 정상 경로는
-                           수십 초 내 완료. SoT B2 예산(10분=600s) 내.
+                           수십 초 내 완료. BFF 가 허용하는 잡 대기
+                           상한(10분) 안에 들어온다.
       GEMINI_TIMEOUT_SECONDS: Gemini 호출 1건의 한도. GeminiClient 내부
                               `generate_text` / `generate_structured` 가
                               `asyncio.wait_for` 로 강제.

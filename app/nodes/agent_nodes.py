@@ -1,6 +1,6 @@
 """LangGraph 노드 함수.
 
-파이프라인 (SoT §6.1 C1 흐름):
+파이프라인 (초기 추천 흐름):
   parse_input -> fetch_weather -> search_places
   -> rules_filter -> score_and_rank        (hub /v1/rules/* 대기 — no-op)
   -> recommend_places -> recommend_route
@@ -344,7 +344,7 @@ class AgentState(TypedDict):
 
 
 async def _emit_stage(state: AgentState, stage: str) -> None:
-    """진행 이벤트(agent:jobs:status) 발행 — best-effort (SoT §4.5).
+    """진행 이벤트(agent:jobs:status) 발행 — best-effort.
 
     각 노드 진입부에서 호출된다. 발행 실패(redis 장애·미주입 등)는
     **모든 예외를 삼켜** 잡 실행에 영향을 주지 않는다. stage 값은
@@ -537,7 +537,7 @@ async def search_places(state: AgentState) -> AgentState:
         return state
     candidates = _merge_place_results(results)
     # Mode 1 재탐색(stage="mode1")의 exclude 반영: 직전 추천 장소의
-    # content_id 를 후보에서 제거한다(SoT §6.2 exclude_list). content_id
+    # content_id 를 후보에서 제거한다(재탐색 제외 목록). content_id
     # 가 없는 후보는 대조 불가라 통과시킨다. 전량 제외되면 아래의 기존
     # 저하 규칙(grounded=False → invent 폴백)을 그대로 탄다.
     # 한계: invent 폴백은 LLM 창작 장소라 content_id 기반 exclude 를
@@ -750,11 +750,11 @@ def _build_reason_prompt(
 
 
 async def rules_filter(state: AgentState) -> AgentState:
-    """결정적 룰 필터 — 이동수단 반경으로 실측 후보를 거른다 (SoT §7.3).
+    """결정적 룰 필터 — 이동수단 반경으로 실측 후보를 거른다.
 
     hub `POST /v1/rules/filter/mobility-radius` 에 {origin, mobility,
-    candidates} 를 보내 반경 통과 후보만 `state["candidates"]` 에 남긴다
-    (반경: foot=3km, bicycle=10km, kickboard=7km, car=무제한).
+    candidates} 를 보내 반경 통과 후보만 `state["candidates"]` 에 남긴다.
+    반경 값은 hub 룰 엔진이 단독으로 정하며 agent 는 복제하지 않는다.
 
     선조건(어느 하나라도 해당하면 원본 그대로 통과 — 비파괴):
       - `state["error"]` 가 이미 설정됨.
@@ -821,7 +821,7 @@ async def rules_filter(state: AgentState) -> AgentState:
 
 
 async def score_and_rank(state: AgentState) -> AgentState:
-    """점수·랭킹 — 일별 강수확률 기반 실내 보너스로 후보를 재정렬 (SoT §4.3).
+    """점수·랭킹 — 일별 강수확률 기반 실내 보너스로 후보를 재정렬.
 
     hub `POST /v1/rules/score/indoor-bonus` 로 일별 PoP 기반 실내(+보너스)
     점수를 받아 `state["scores"]`(content_id→score) 를 만들고,
@@ -1348,7 +1348,7 @@ async def recommend_route(state: AgentState) -> AgentState:
 
 
 async def llm_reason(state: AgentState) -> AgentState:
-    """LLM 3번째 호출 — 장소별 추천 이유 + 옷차림 안내 생성 (SoT §6.1).
+    """LLM 3번째 호출 — 장소별 추천 이유 + 옷차림 안내 생성.
 
     선조건 분기: `state["error"]` 가 있거나 places 가 없으면 no-op.
 

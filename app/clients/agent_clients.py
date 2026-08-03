@@ -307,7 +307,7 @@ class StreamsPublisher:
         return message_id
 
     async def publish_status(self, job_id: str, stage: str) -> str:
-        """노드 진행 이벤트 1건을 stream 에 발행한다 (SoT §4.5).
+        """노드 진행 이벤트 1건을 stream 에 발행한다.
 
         인자:
           job_id: 잡 식별자.
@@ -477,7 +477,7 @@ class GeminiClient:
 
         동작:
           - limiter 가 있으면 호출 직전 `await limiter.acquire()` 로
-            token-bucket/일일 카운터를 소비한다(SoT §10.2).
+            token-bucket/일일 카운터를 소비한다.
           - GenerateContentConfig 에 `response_mime_type="application/json"`,
             `response_schema=response_schema`, `system_instruction`,
             `temperature`, `max_output_tokens` 를 설정해 JSON 출력을 강제.

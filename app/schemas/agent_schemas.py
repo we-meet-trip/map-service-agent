@@ -78,10 +78,9 @@ class Mobility(str, Enum):
 
     walk: 도보.
     bicycle: 자전거.
-    scooter: 전동 킥보드. SoT(def §3.6)의 kickboard 와 같은 개념이며,
-        hub 룰이 두 철자를 모두 받아 반경 7km 를 적용한다. 예전에는 이 값이
-        없어 BFF 가 킥보드를 bicycle 로 치환했고, 그 결과 킥보드 전용 반경이
-        한 번도 적용되지 않았다.
+    scooter: 전동 킥보드. kickboard 와 같은 개념이며 hub 룰이 두 철자를 모두
+        받는다. 반경은 자전거와 같지만 소요시간 보정 계수와 경로 프로파일이
+        달라, bicycle 로 치환하지 않고 별도 값으로 전달해야 한다.
     car: 자가용/택시 등 자동차.
     transit: 대중교통(버스/지하철 등).
 
@@ -168,7 +167,7 @@ class AgentRequest(BaseModel):
     mobility: 선호 이동 수단(`Mobility`). 없을 수 있음.
     province: 광역 행정구역(예: "서울특별시"). 1~20자.
     city: 시/군/구(예: "강남구"). 1~20자.
-    schedule_id: user-BFF 의 일정 식별자(SoT §6.1 B2 body). 추적/영속화
+    schedule_id: user-BFF 의 일정 식별자. 추적/영속화
                  연계용 패스스루 — agent 는 user_service 스키마를 읽지
                  않으므로 이 값으로 조회하지 않는다. nullable.
     stage: 추천 단계.
@@ -282,7 +281,7 @@ class Place(BaseModel):
     route_idx: Optional[str] = None
     # 외부 실측 후보에 근거해 만든 장소면 True, LLM 단독 생성이면 False.
     grounded: bool = True
-    # llm_reason 노드가 병합하는 장소별 추천 이유(SoT §3 agent 책임).
+    # llm_reason 노드가 병합하는 장소별 추천 이유.
     # LLM 응답(ReasonEnvelope)에서 검증을 거친 값만 들어온다. 생성
     # 시점에는 없다가 build_payload 에서 model_copy 로 채워진다.
     reason: Optional[str] = Field(default=None, max_length=200)

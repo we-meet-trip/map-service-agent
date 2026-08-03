@@ -1,16 +1,16 @@
 """Gemini 호출 rate-limit — token-bucket(RPM) + 일일 카운터(RPD cap).
 
-SoT §10.2 의 설계를 구현한다:
+외부 API 가 분당·일일 두 축으로 한도를 걸므로 두 축을 함께 집행한다:
 
   Redis DB3 key "gemini:tokens"          — leaky/token bucket (용량 10,
                                            refill 10/min = RPM 10 매칭)
   Redis DB3 key "gemini:daily:{YYYYMMDD}" — KST 기준 일일 카운터
-                                           (R-01: cap 200/일, KST 자정 TTL)
+                                           (cap 200/일, KST 자정 TTL)
 
 두 검사와 소비는 Lua 스크립트 1회의 EVAL 로 원자적으로 수행된다
 (다중 코루틴/다중 프로세스에서도 이중 소비 없음).
 
-호출 흐름 (SoT §10.2 그대로):
+호출 흐름:
   1. try-consume 1 token
   2. OK          → Gemini API 호출 진행
   3. RPM DENIED  → 반환된 대기시간만큼 sleep 후 재시도, 누적 60초 초과 시
@@ -31,7 +31,7 @@ import redis.asyncio as aioredis
 _sleep = asyncio.sleep
 
 # KST(UTC+9). 일일 카운터의 날짜 경계와 TTL 산정에 사용 —
-# Mode 1 카운터(SoT §4.4)와 동일하게 KST 자정 리셋으로 일관.
+# 재탐색 카운터와 동일하게 KST 자정 리셋으로 일관.
 _KST = timezone(timedelta(hours=9))
 
 # 반환 규약: {status, wait_ms}
@@ -87,7 +87,7 @@ class GeminiQuotaError(RuntimeError):
     code: "gemini_rpm_exceeded"(60초 대기 후에도 버킷 고갈) 또는
           "gemini_rpd_exceeded"(일일 cap 도달).
     str(예외) 가 code 그대로가 되도록 하여, `_run_job` 이 실패 페이로드의
-    error 필드에 SoT §10.2 의 에러 코드를 그대로 싣게 한다.
+    error 필드에 이 코드를 그대로 싣게 한다.
     """
 
     def __init__(self, code: str) -> None:
@@ -117,12 +117,12 @@ class GeminiRateLimiter:
         """GeminiRateLimiter 초기화.
 
         redis_url: redis 접속 URL.
-        db: rate-limit 전용 논리 DB 번호(SoT §8.3: DB3).
+        db: rate-limit 전용 논리 DB 번호(DB3).
         capacity: 버킷 용량(기본 10 = RPM 10).
         refill_per_min: 분당 리필 토큰 수(기본 10).
-        daily_cap: 일일 호출 상한(R-01: 200, 예비 50).
-        max_wait_seconds: RPM 고갈 시 누적 대기 상한. 초과 시
-                          gemini_rpm_exceeded (SoT §10.2: 60초).
+        daily_cap: 일일 호출 상한(기본 200, 예비 50 남김).
+        max_wait_seconds: RPM 고갈 시 누적 대기 상한(기본 60초). 초과 시
+                          gemini_rpm_exceeded.
         tokens_key / daily_key_prefix: Redis 키 이름 규약.
 
         호출처: `app/main.py` lifespan.

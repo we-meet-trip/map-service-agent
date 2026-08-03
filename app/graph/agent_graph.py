@@ -32,7 +32,7 @@ stage="route" 분기:
   (각 노드도 `state["error"]` 를 보고 자체 no-op 하므로, 단축 분기는
   불필요한 LLM/HTTP 호출을 줄이는 최적화다.)
 
-체크포인터 (SoT B5):
+체크포인터:
   `build_graph(checkpointer=...)` 로 주입한다. None 이면 체크포인트 없이
   컴파일한다(단위 테스트·CHECKPOINT_ENABLED=false). 주입 시 `_run_job`
   은 `config={"configurable": {"thread_id": job_id}}` 로 invoke 해야 한다.
