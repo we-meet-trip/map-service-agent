@@ -281,6 +281,24 @@ class Place(BaseModel):
     route_idx: Optional[str] = None
     # 외부 실측 후보에 근거해 만든 장소면 True, LLM 단독 생성이면 False.
     grounded: bool = True
+    # ── 시간축 ────────────────────────────────────────────────────
+    # 아래 셋은 build_timeline 이 계산해 build_payload 에서 병합한다. 전부
+    # 선택값인 이유는 두 가지다 — 시간축 도입 전에 저장된 페이로드가 그대로
+    # 검증을 통과해야 하고, 타임라인 계산이 저하되면 값 없이도 일정이 나가야
+    # 하기 때문이다.
+    #
+    # stay_minutes: 이 장소에 머무는 시간(분). hub 룰이 분류로 추정한다.
+    #     숙박처럼 일정 시간에 넣지 않는 분류는 0 이다.
+    # visit_start / visit_end: 확정된 방문 시각("HH:MM"). 하루 활동 시작
+    #     시각에서 출발해 이동시간과 체류시간을 누적해 얻는다.
+    #     기존 recommended_visit_time(자유 텍스트)과 의미가 다르므로 그 필드를
+    #     대체하지 않고 나란히 둔다.
+    # stay_source: 체류시간을 어디서 얻었는지. course_actual|category|default.
+    stay_minutes: Optional[int] = Field(default=None, ge=0, le=1440)
+    visit_start: Optional[str] = Field(default=None, max_length=5)
+    visit_end: Optional[str] = Field(default=None, max_length=5)
+    stay_source: Optional[str] = Field(default=None, max_length=16)
+
     # llm_reason 노드가 병합하는 장소별 추천 이유.
     # LLM 응답(ReasonEnvelope)에서 검증을 거친 값만 들어온다. 생성
     # 시점에는 없다가 build_payload 에서 model_copy 로 채워진다.
@@ -531,6 +549,14 @@ class JobDonePayload(BaseModel):
     legs: 성공 시 동선 구간 리스트. 실패 시 None.
     clothing: 성공 시 날씨 기반 옷차림 안내(llm_reason 산출). llm_reason
               이 degrade 로 생략되면 None 일 수 있다.
+    timeline_status: 시간축이 어떻게 정해졌는지. 소비자가 값의 신뢰도를
+              가늠하는 데 쓴다.
+                ok        — 하루 활동 시간 안에 그대로 들어갔다
+                trimmed   — 넘쳐서 체류시간을 줄이거나 뒤 장소를 덜어 냈다
+                unverified— 계산을 하지 못했다(저하). 시각 필드가 비어 있다
+              시간축 도입 전 페이로드에는 이 키가 없다.
+    warnings: 사용자에게 알려야 하는 한계. 예를 들어 영업시간을 확인할 수
+              있는 출처가 없어 "그 시각에 문이 열려 있는지"는 보장하지 못한다.
     error: 실패 시 사유 텍스트. 성공 시 None.
 
     직렬화:
@@ -548,4 +574,8 @@ class JobDonePayload(BaseModel):
     visit_order: Optional[List[int]] = None
     legs: Optional[List[Leg]] = None
     clothing: Optional[str] = None
+    timeline_status: Optional[
+        Literal["ok", "trimmed", "unverified"]
+    ] = None
+    warnings: Optional[List[str]] = None
     error: Optional[str] = None

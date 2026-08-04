@@ -49,6 +49,20 @@ class _FakeHub:
         return {"places": self._places, "count": len(self._places)}
 
 
+    async def estimate_dwell(self, places):
+        # 체류시간은 hub 룰이 정한다. 여기서는 요청한 장소마다 같은 값을
+        # 돌려주어 시각 계산이 결정적으로 돌아가게만 한다.
+        return {
+            "estimates": [
+                {
+                    "content_id": p["content_id"],
+                    "stay_minutes": 30,
+                    "source": "category",
+                }
+                for p in places
+            ]
+        }
+
 def _run_search(req: AgentRequest, places: list) -> dict:
     deps.set_hub_client(_FakeHub(places))
     try:

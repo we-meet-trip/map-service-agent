@@ -227,6 +227,28 @@ class HubClient:
         r.raise_for_status()
         return r.json()
 
+    async def estimate_dwell(self, places: list[dict]) -> dict:
+        """hub `POST /v1/rules/estimate/dwell` 로 장소별 체류시간을 받는다.
+
+        인자(JSON body 로 전달):
+          places: `{"content_id", "category_group_code", "course_minutes"}`
+                  리스트. 뒤 두 키는 없어도 된다.
+
+        실패 시:
+          - 4xx/5xx 응답이면 `raise_for_status()` 가 `httpx.HTTPStatusError`.
+          - 네트워크/타임아웃 류는 `httpx.HTTPError` 의 하위 예외.
+
+        반환: hub 응답 본문 dict. estimates(`{content_id, stay_minutes,
+        source}` 리스트) 키.
+        호출처: `agent_nodes.build_timeline` 노드(예외는 저하로 흡수).
+        """
+        body = {"places": places}
+        r = await self._client.post(
+            f"{self._base}/v1/rules/estimate/dwell", json=body
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def aclose(self) -> None:
         """내부 `httpx.AsyncClient` 를 닫는다.
 

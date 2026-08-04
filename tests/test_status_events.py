@@ -67,6 +67,20 @@ class _FakeHub:
     async def score_indoor_bonus(self, pois, day_pop_max):
         return {"scored": []}
 
+    async def estimate_dwell(self, places):
+        # 체류시간은 hub 룰이 정한다. 여기서는 요청한 장소마다 같은 값을
+        # 돌려주어 시각 계산이 결정적으로 돌아가게만 한다.
+        return {
+            "estimates": [
+                {
+                    "content_id": p["content_id"],
+                    "stay_minutes": 30,
+                    "source": "category",
+                }
+                for p in places
+            ]
+        }
+
     async def fetch_reviews(self, query, *, display=3):
         return {"reviews": [], "count": 0, "query": query}
 
@@ -105,12 +119,6 @@ _HAPPY_GEMINI = lambda: _SeqGemini([  # noqa: E731
         PlaceSelection(index=0, day=1, recommended_visit_time="오전"),
         PlaceSelection(index=1, day=1, recommended_visit_time="오후"),
     ]),
-    RouteEnvelope(visit_order=[0, 1], legs=[
-        Leg.model_validate({
-            "from": 0, "to": 1, "mode": "walk",
-            "estimated_distance_km": 1.0, "estimated_duration_min": 10,
-        })
-    ]),
     ReasonEnvelope(
         reasons=[
             PlaceReason(place_id=0, reason="이유0"),
@@ -121,8 +129,10 @@ _HAPPY_GEMINI = lambda: _SeqGemini([  # noqa: E731
 ])
 
 _ALL_STAGES = [
-    "parse_input", "fetch_weather", "search_places", "rules_filter",
-    "score_and_rank", "recommend_places", "recommend_route", "llm_reason",
+    "parse_input", "fetch_weather", "plan_strategy", "search_places",
+    "rules_filter",
+    "score_and_rank", "recommend_places", "recommend_route",
+    "build_timeline", "fit_time_budget", "llm_reason",
     "build_payload",
 ]
 

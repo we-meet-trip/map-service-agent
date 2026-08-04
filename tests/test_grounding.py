@@ -78,6 +78,20 @@ class _FakeHub:
         return self._resp
 
 
+    async def estimate_dwell(self, places):
+        # 체류시간은 hub 룰이 정한다. 여기서는 요청한 장소마다 같은 값을
+        # 돌려주어 시각 계산이 결정적으로 돌아가게만 한다.
+        return {
+            "estimates": [
+                {
+                    "content_id": p["content_id"],
+                    "stay_minutes": 30,
+                    "source": "category",
+                }
+                for p in places
+            ]
+        }
+
 class _FakeGemini:
     """generate_structured 가 미리 정한 결과를 돌려주는 대역."""
 

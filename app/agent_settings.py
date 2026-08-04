@@ -129,6 +129,11 @@ class AgentSettings(BaseSettings):
                      엔드포인트를 호출해 반경 필터·실내 보너스 랭킹을
                      적용한다. False 면 두 노드가 no-op pass-through 로
                      복귀한다(kill-switch — hub 장애/회귀 시 즉시 무력화).
+      TIMELINE_ENABLED: True(기본)면 build_timeline 이 hub 체류시간 룰로
+                     방문 시각을 계산하고, 하루 활동 시간을 넘치면
+                     fit_time_budget 이 결정적으로 줄인다. False 면 두 노드가
+                     통과만 해 페이로드가 시간축 도입 전과 같아진다.
+      TIMELINE_BUFFER_MINUTES: 장소 사이에 두는 여유(분).
 
     Redis Streams 관련:
       REDIS_URL: redis 접속 URL.
@@ -219,6 +224,14 @@ class AgentSettings(BaseSettings):
     SUMMARY_MAX_LLM_CALLS: int = 2
 
     RULES_ENABLED: bool = True  # kill-switch — 장애 시 no-op 복귀
+
+    # 시간축(체류시간·방문 시각) 산출 스위치. False 면 build_timeline 과
+    # fit_time_budget 이 no-op 으로 통과해 페이로드가 도입 전과 같아진다.
+    TIMELINE_ENABLED: bool = True
+    # 한 장소와 다음 장소 사이에 두는 여유(분). 길 찾기·주차·대기처럼
+    # 이동시간에 잡히지 않는 시간을 흡수한다. 0 으로 두면 일정이 분 단위로
+    # 빈틈없이 붙어 실제로 지킬 수 없는 시간표가 된다.
+    TIMELINE_BUFFER_MINUTES: int = 10
 
     REDIS_URL: str = "redis://redis:6379"
     REDIS_DB_STREAMS: int = 2

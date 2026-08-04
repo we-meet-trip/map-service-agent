@@ -73,6 +73,20 @@ class _FakeHub:
         self.search_calls += 1
         return {"places": [], "count": 0}
 
+    async def estimate_dwell(self, places):
+        # 체류시간은 hub 룰이 정한다. 여기서는 요청한 장소마다 같은 값을
+        # 돌려주어 시각 계산이 결정적으로 돌아가게만 한다.
+        return {
+            "estimates": [
+                {
+                    "content_id": p["content_id"],
+                    "stay_minutes": 30,
+                    "source": "category",
+                }
+                for p in places
+            ]
+        }
+
     async def fetch_reviews(self, query, *, display=3):
         return {
             "reviews": [{"description": f"{query} 후기"}],
@@ -222,12 +236,12 @@ def test_load_given_places_noop_on_error() -> None:
 def test_route_stage_skips_search_and_selection() -> None:
     """장소 탐색을 부르지 않고 LLM 은 동선·이유 2회만 쓴다."""
     hub = _FakeHub()
-    gemini = _SeqGemini([_route_envelope(2), _reason_envelope(2)])
+    gemini = _SeqGemini([_reason_envelope(2)])
 
     out, pub = _invoke(_request(), hub, gemini)
 
     assert hub.search_calls == 0
-    assert gemini.calls == 2
+    assert gemini.calls == 1
     assert out.get("error") is None
     payload = pub.payloads[0]
     assert payload["status"] == "done"
@@ -247,10 +261,10 @@ def test_route_stage_stays_within_llm_budget() -> None:
     from app.agent_settings import get_settings
 
     hub = _FakeHub()
-    gemini = _SeqGemini([_route_envelope(2), _reason_envelope(2)])
+    gemini = _SeqGemini([_reason_envelope(2)])
     out, _ = _invoke(_request(), hub, gemini)
 
-    assert out["llm_calls_used"] == 2
+    assert out["llm_calls_used"] == 1
     assert out["llm_calls_used"] <= get_settings().GEMINI_MAX_CALLS_PER_REQUEST
 
 
