@@ -460,11 +460,16 @@ async def fetch_weather(state: AgentState) -> AgentState:
       `get_hub_client()` 로 HubClient 를 얻어 province/city/date 구간을
       넘기고 응답 dict 를 `state["weather"]` 에 저장.
 
-    실패 처리:
-      - `httpx.HTTPStatusError`: 본문 200자까지 잘라 "hub /v1/weather
-        {status}: {body}" 형태로 `state["error"]` 에 기록.
-      - 그 외 `httpx.HTTPError` (네트워크/타임아웃 등): "hub unreachable:
-        {예외 클래스 이름}" 형태로 기록.
+    실패 처리 — **추천을 중단하지 않는다.**
+      날씨는 장소 선택에 가중치를 주는 재료이지 일정 자체의 전제가
+      아니다. 같은 그래프의 장소 검색·시간축 노드도 실패를 저하로
+      흡수하는데 날씨만 잡을 통째로 실패시키면, 부가 정보 하나 때문에
+      사용자가 아무것도 못 받는다. 그래서 호출이 깨지면 날씨 없이
+      진행하고 그 사실만 경고로 남긴다.
+
+      예보를 받았지만 일부 날짜가 비어 있을 때도 같은 이유로 경고를
+      남긴다. 아래 일차별 계산은 예보가 없는 날을 강수확률 0 으로
+      다루므로, 알리지 않으면 "비 안 옴"과 구분되지 않는다.
 
     호출처: LangGraph(parse_input 다음).
     """
@@ -483,16 +488,52 @@ async def fetch_weather(state: AgentState) -> AgentState:
             req.date.date_end,
         )
     except httpx.HTTPStatusError as e:
-        state["error"] = (
-            f"hub /v1/weather {e.response.status_code}: "
-            f"{e.response.text[:200]}"
+        logger.warning(
+            "hub /v1/weather %s: %s",
+            e.response.status_code, e.response.text[:200],
         )
+        _add_warning(state, _WARN_WEATHER_UNAVAILABLE)
         return state
     except httpx.HTTPError as e:
-        state["error"] = f"hub unreachable: {type(e).__name__}"
+        logger.warning("hub /v1/weather unreachable: %s", type(e).__name__)
+        _add_warning(state, _WARN_WEATHER_UNAVAILABLE)
         return state
     state["weather"] = weather
+    _warn_missing_forecast_days(state, weather)
     return state
+
+
+def _warn_missing_forecast_days(
+    state: AgentState, weather: dict
+) -> None:
+    """예보가 비어 있는 날이 여행 기간에 걸치면 경고를 남긴다.
+
+    hub 는 채우지 못한 날짜를 `missing_dates` 로 알려 주는데, 이를 읽지
+    않으면 그 날은 조용히 강수확률 0 으로 처리되어 맑은 날과 똑같이
+    취급된다. 여행 기간 밖의 날짜는 무시한다.
+    """
+    if not isinstance(weather, dict):
+        return
+    missing = weather.get("missing_dates")
+    if not isinstance(missing, list):
+        return
+    req = state["request"]
+    start, end = req.date.date_start, req.date.date_end
+    hit: list[str] = []
+    for raw in missing:
+        key = str(raw)
+        try:
+            parsed = date.fromisoformat(key)
+        except ValueError:
+            continue
+        if start <= parsed <= end:
+            hit.append(key)
+    if hit:
+        _add_warning(
+            state,
+            f"{', '.join(sorted(hit))} 는 날씨 예보를 확인하지 못해 "
+            "강수확률 0 으로 계산했습니다",
+        )
 
 
 async def plan_strategy(state: AgentState) -> AgentState:
@@ -1570,6 +1611,9 @@ async def llm_reason(state: AgentState) -> AgentState:
 _WARN_NO_OPENING_HOURS = "영업시간은 확인하지 않았습니다"
 # 자동차·대중교통은 도로 경로 조회 대상이 아니라 이동시간이 추정값이다.
 _WARN_TRAVEL_ESTIMATED = "자동차·대중교통 이동시간은 추정값입니다"
+# 날씨 조회가 실패해도 일정은 만든다. 대신 날씨를 반영하지 못했다는
+# 사실을 숨기지 않는다 — 실내/실외 비중이 기본값으로 정해지기 때문이다.
+_WARN_WEATHER_UNAVAILABLE = "날씨 정보를 확인하지 못해 일정에 반영하지 못했습니다"
 
 
 def _add_warning(state: AgentState, message: str) -> None:

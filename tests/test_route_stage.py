@@ -67,7 +67,12 @@ class _FakeHub:
         self.search_calls = 0
 
     async def fetch_weather(self, province, city, date_start, date_end):
-        return {"daily": [{"date": "2026-07-06", "pop": 30}]}
+        return {
+            "daily": [
+                {"date": "2026-07-06", "precipitation_prob": 30}
+            ],
+            "missing_dates": [],
+        }
 
     async def search_places(self, province, city, **kwargs):
         self.search_calls += 1
