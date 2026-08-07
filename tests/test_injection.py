@@ -11,7 +11,6 @@ from datetime import date, time
 
 from app.nodes.agent_nodes import (
     _build_places_prompt,
-    _build_route_prompt,
     _build_selection_prompt,
 )
 from app.schemas.agent_schemas import (
@@ -77,50 +76,10 @@ def test_places_prompt_fences_survive_malicious_inputs() -> None:
     assert "무시" not in system
 
 
-def test_route_prompt_view_is_slim_and_bounded() -> None:
-    """route 프롬프트 뷰는 5개 필드로 축약되고 장소명 길이가 상한된다.
-
-    태그 문자가 든 장소명은 Place 스키마 검증(agent_schemas)이 생성
-    자체를 거부하므로(test_output_validation 커버), 여기서는 뷰 축약과
-    길이 상한·펜스 무결성만 검증한다.
-    """
-    import json as _json
-
-    req = _request()
-    places = [
-        Place(
-            place_id=0,
-            name="장" * 80,  # 스키마 상한(80)까지 채운 이름
-            address="a",
-            lat=37.5,
-            lng=127.0,
-            recommended_visit_time="오전",
-        ),
-        Place(
-            place_id=1,
-            name="정상장소",
-            address="b",
-            lat=37.6,
-            lng=127.1,
-            recommended_visit_time="오후",
-            phone="02-000-0000",
-            place_url="http://example/place",
-        ),
-    ]
-    system, user = _build_route_prompt(req, places)
-    assert user.count("<user_input>") == 1
-    assert user.count("</user_input>") == 1
-    payload = _json.loads(
-        user.split("<user_input>")[1].split("</user_input>")[0]
-    )
-    view = payload["places"]
-    # 축약 뷰: 5개 필드만 (13개 optional 필드 미포함 — 컨텍스트 비대 방지)
-    assert set(view[0].keys()) == {
-        "place_id", "name", "lat", "lng", "recommended_visit_time",
-    }
-    assert "phone" not in view[1] and "place_url" not in view[1]
-    assert all(len(v["name"]) <= 80 for v in view)
-
+# 동선 프롬프트 테스트가 여기 있었다. 방문 순서를 모델이 아니라 계산으로
+# 정하도록 바꾸면서 그 프롬프트 자체가 사라졌다 — 장소 이름이 모델에게
+# 흘러가던 통로 하나가 없어진 것이라, 검증할 대상이 남지 않는다.
+# 남은 프롬프트(선정·창작·이유)의 펜스와 상한은 위아래 테스트가 지킨다.
 
 def test_theme_count_and_length_limits() -> None:
     """theme 항목 수(10)와 항목 길이(30)가 상한된다."""

@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -50,14 +51,43 @@ from app.clients.agent_clients import (
     StreamsPublisher,
 )
 from app.graph.agent_graph import build_graph
-from app.llm.rate_limit import GeminiRateLimiter
+from app.graph.summary_graph import SUMMARY_GRAPH
+from app.llm.rate_limit import GeminiQuotaError, GeminiRateLimiter
+from app.llm.structured_call import LLMBudgetExceeded
 from app.schemas.agent_schemas import (
     AgentJobAccepted,
     AgentRequest,
     JobDonePayload,
+    PlaceSummaryResult,
+    ReviewsSummaryBatchRequest,
+    ReviewsSummaryBatchResponse,
+    ReviewsSummaryRequest,
+    ReviewsSummaryResponse,
+    SummaryPlaceRequest,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_logging(level: str) -> None:
+    """루트 로거에 stdout 핸들러를 붙인다(핸들러가 없을 때만).
+
+    uvicorn 의 기본 로깅 설정은 `uvicorn*` 로거만 구성하고 루트 로거는
+    건드리지 않는다. 그래서 이 함수 없이는 `app.*` 로거로 남긴 기록이
+    출력 대상을 못 찾아 전량 유실된다.
+
+    이미 핸들러가 있으면(uvicorn `--log-config`, 테스트 하니스, 상위
+    호스트가 설정한 경우) 그 설정을 존중하고 아무것도 하지 않는다 —
+    핸들러를 덧붙이면 같은 로그가 두 줄씩 출력된다.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    logging.basicConfig(
+        level=level.upper(),
+        stream=sys.stdout,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
 
 @asynccontextmanager
@@ -65,6 +95,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan — 시작 시 외부 클라이언트 및 그래프 준비, 종료 시 정리.
 
     동작:
+      - `_configure_logging(LOG_LEVEL)` 로 루트 로거를 가장 먼저 세운다.
       - `get_settings()` 로 환경설정을 읽고, `GEMINI_API_KEY` 가 비어 있으면
         `RuntimeError("GEMINI_API_KEY is required")` 로 즉시 실패.
       - `INTERNAL_SERVICE_TOKEN` 이 설정되어 있으면 그 SecretStr 평문 값을
@@ -87,6 +118,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
       - `reset_all()` 로 모든 전역 슬롯을 None 으로 되돌린다.
     """
     settings = get_settings()
+    # 로깅은 다른 어떤 초기화보다 먼저 — 아래 fail-fast 게이트가 걸릴 때도
+    # 원인이 stdout 에 남아야 한다.
+    _configure_logging(settings.LOG_LEVEL)
     if not settings.GEMINI_API_KEY.get_secret_value():
         raise RuntimeError("GEMINI_API_KEY is required")
 
@@ -116,7 +150,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stream=settings.STREAM_NAME,
         maxlen=settings.STREAM_MAXLEN,
     )
-    # 진행 이벤트(agent:jobs:status, SoT §4.5) 전용 발행자. done 스트림과
+    # 진행 이벤트(agent:jobs:status) 전용 발행자. done 스트림과
     # 동일 DB 에 둔다. 소비자는 후속 주차(user-BFF progress) — 발행만 한다.
     status_streams = StreamsPublisher(
         redis_url=settings.REDIS_URL,
@@ -124,7 +158,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stream=settings.STATUS_STREAM_NAME,
         maxlen=settings.STATUS_STREAM_MAXLEN,
     )
-    # Gemini 호출 한도 집행기(SoT §10.2·R-01). GeminiClient 가 generate
+    # Gemini 호출 한도 집행기. GeminiClient 가 generate
     # 직전 acquire() 로 소비하며, RPM/RPD 초과 시 GeminiQuotaError 로
     # 잡이 실패 페이로드(gemini_rpm_exceeded / gemini_rpd_exceeded)를 낸다.
     limiter = GeminiRateLimiter(
@@ -153,7 +187,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     set_status_publisher(status_streams)
     set_gemini_client(gemini)
 
-    # LangGraph Postgres 체크포인터 (SoT B5, schema=langgraph).
+    # LangGraph Postgres 체크포인터 (schema=langgraph).
     # CHECKPOINT_ENABLED=true 인데 연결/스키마 준비가 실패하면 부팅을
     # 중단한다(fail-fast — GEMINI_API_KEY 부재와 동일 패턴, 사용자 결정
     # 2026-07-05). 관련 모듈은 지연 import 한다 — 로컬 단위 테스트
@@ -283,7 +317,7 @@ Instrumentator().instrument(app).expose(
 
 
 def _verify_internal_token(provided: str | None) -> None:
-    """B2 인바운드 요청의 `X-Internal-Token` 을 검증한다 (SoT §5.5).
+    """B2 인바운드 요청의 `X-Internal-Token` 을 검증한다.
 
     - `INTERNAL_SERVICE_TOKEN` 이 설정된 경우: 헤더 부재 또는 불일치 시
       401. 비교는 `hmac.compare_digest` 로 상수 시간 수행.
@@ -422,7 +456,7 @@ async def recommend(
 
     인자:
       req: 요청 본문. `AgentRequest` 스키마.
-      x_internal_token: B2 내부 서비스 인증 헤더(SoT §5.5). 토큰이
+      x_internal_token: B2 내부 서비스 인증 헤더. 토큰이
         설정된 배포에서 부재/불일치면 401.
 
     동작:
@@ -455,3 +489,109 @@ async def recommend(
     bg_tasks.add(task)
     task.add_done_callback(bg_tasks.discard)
     return AgentJobAccepted(job_id=job_id)
+
+
+async def _run_summary(
+    places: list[SummaryPlaceRequest],
+) -> dict[int, list[str]]:
+    """요약 파이프라인을 한 번 돌려 요청 위치별 두 줄을 돌려준다.
+
+    두 요약 엔드포인트가 이 함수를 공유한다. 한도 초과와 그 밖의 실패를
+    가르는 기준이 두 곳으로 갈라지면 같은 원인이 경로에 따라 다른 상태로
+    나가기 때문이다.
+
+    반환: 요청 배열의 위치 → 두 줄. 근거를 못 구한 장소는 키가 없다.
+
+    실패 처리:
+      - 호출 한도에 걸리면 429. 호출 측은 요약 없이 화면을 그린다.
+      - 모델 응답이 형식을 벗어나거나 호출이 실패하면 502.
+      - 형식은 맞지만 쓸 만한 두 줄이 나오지 않으면 빈 결과. 요약이 없는
+        것은 오류가 아니라 근거가 부족한 상태다.
+    """
+    if not get_settings().SUMMARY_ENABLED:
+        logger.info("reviews summary disabled by settings")
+        return {}
+    state = {
+        "places": [
+            {
+                "name": p.place_name,
+                "category": p.category,
+                "snippets": [r.description for r in p.reviews],
+            }
+            for p in places
+        ]
+    }
+    try:
+        out = await SUMMARY_GRAPH.ainvoke(state)
+    except (LLMBudgetExceeded, GeminiQuotaError) as e:
+        logger.info("reviews summary rate limited: %s", type(e).__name__)
+        raise HTTPException(
+            status_code=429, detail="summary rate limited"
+        ) from e
+    except Exception as e:  # noqa: BLE001 — 원인은 로그로만 남긴다
+        logger.warning("reviews summary failed: %s", type(e).__name__)
+        raise HTTPException(
+            status_code=502, detail="summary unavailable"
+        ) from e
+    return out.get("bullets") or {}
+
+
+@app.post("/v1/reviews/summary", response_model=ReviewsSummaryResponse)
+async def summarize_place_reviews(
+    req: ReviewsSummaryRequest,
+    x_internal_token: str | None = Header(
+        default=None, alias="X-Internal-Token"
+    ),
+) -> ReviewsSummaryResponse:
+    """장소 한 곳의 블로그 후기를 두 줄로 요약해 즉시 돌려준다.
+
+    장소를 눌렀을 때 부르는 경로다. 미리 만들어 둔 요약이 없거나 만료됐을
+    때 그 자리에서 답한다.
+
+    후기는 호출 측이 이미 받아 둔 것을 그대로 실어 보낸다. 여기서 다시
+    조회하면 외부 호출이 두 배가 되고, 화면에 보이는 목록과 요약의 근거가
+    어긋날 수 있다.
+
+    인자:
+      req: 장소명·분류와 요약 근거가 될 후기 묶음.
+      x_internal_token: 내부 서비스 인증 헤더. 토큰이 설정된 배포에서
+        부재/불일치면 401.
+    """
+    _verify_internal_token(x_internal_token)
+    bullets = await _run_summary([req])
+    return ReviewsSummaryResponse(bullets=bullets.get(0, []))
+
+
+@app.post(
+    "/v1/reviews/summary/batch",
+    response_model=ReviewsSummaryBatchResponse,
+)
+async def summarize_places_reviews(
+    req: ReviewsSummaryBatchRequest,
+    x_internal_token: str | None = Header(
+        default=None, alias="X-Internal-Token"
+    ),
+) -> ReviewsSummaryBatchResponse:
+    """여러 장소의 후기를 한 번에 요약한다.
+
+    일정이 만들어진 직후 그 일정의 장소를 미리 요약해 두는 경로다. 장소마다
+    따로 부르면 호출 수가 장소 수만큼 늘어 분당 상한에 걸리므로, 한 번의
+    모델 호출에 묶어 보낸다.
+
+    응답은 요청 배열의 **위치**로 짚는다. 한 일정에 같은 이름이 두 번 나올
+    수 있어 이름으로는 어느 장소의 요약인지 가릴 수 없다. 근거를 못 구한
+    장소는 결과에서 빠진다 — 부분 커버리지는 정상이다.
+
+    인자:
+      req: 요약 대상 장소 묶음.
+      x_internal_token: 내부 서비스 인증 헤더. 토큰이 설정된 배포에서
+        부재/불일치면 401.
+    """
+    _verify_internal_token(x_internal_token)
+    bullets = await _run_summary(req.places)
+    return ReviewsSummaryBatchResponse(
+        results=[
+            PlaceSummaryResult(index=index, bullets=lines)
+            for index, lines in sorted(bullets.items())
+        ]
+    )

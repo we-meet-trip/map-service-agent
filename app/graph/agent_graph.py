@@ -5,24 +5,45 @@
 호출해 `app.state.graph` 에 저장하고, `_run_job` 이
 `graph.ainvoke({"job_id": ..., "request": ...}, config=...)` 로 실행한다.
 
-파이프라인 (SoT §6.1 C1 흐름):
-  parse_input -> fetch_weather -> search_places
-  -> rules_filter -> score_and_rank      (hub /v1/rules/* 대기 — no-op)
+파이프라인:
+  parse_input -> fetch_weather -> plan_strategy -> search_places
+  -> rules_filter -> score_and_rank      (hub /v1/rules/*)
   -> recommend_places -> recommend_route
+  -> build_timeline -> fit_time_budget   (hub /v1/rules/estimate/dwell)
   -> llm_reason                          (정상 경로 한정, 실패 시 degrade)
   -> build_payload -> publish_done
+
+시간축:
+  build_timeline 이 체류시간과 방문 시각을 계산하고, 하루 활동 시간을
+  넘긴 일차가 있으면 fit_time_budget 이 결정적으로 줄인다. 두 노드 모두
+  LLM 을 쓰지 않으며 실패해도 error 를 세우지 않는다.
+
+블로그 후기 요약은 이 그래프에 없다. 요약은 일정에 딸려 나오는 값이 아니라
+장소를 눌렀을 때 필요한 정보이므로 별도 파이프라인
+(`app/graph/summary_graph.py`)이 맡는다.
+
+stage="route" 분기:
+  사용자가 방문지를 이미 골라 온 요청은 탐색·선정 구간이 통째로 불필요하다.
+  fetch_weather 다음에서 갈라져 load_given_places 로 장소를 세운 뒤 곧장
+  recommend_route 에 합류한다(이후 구간은 공용). 전략도 탐색도 필요 없으므로
+  LLM 호출은 이유 1회뿐이다.
+
+LLM 호출:
+  선정 1 + 이유 1 = 2회다. 방문 순서와 구간은 recommend_route 가 좌표로
+  계산하므로 모델을 부르지 않는다. 요청당 상한 3 에서 1회가 남아, 앞 단계가
+  형식을 한 번 어겨도 교정 재시도로 복구할 수 있다.
 
 에러 라우팅 (`_route_after`):
   parse_input / fetch_weather / recommend_places / recommend_route 중
   어느 노드든 `state["error"]` 를 설정하면 후속 노드를 건너뛰고
   `build_payload` 로 단축 분기한다. llm_reason 은 error 를 만들지 않는
   enhancement 노드(실패 시 degrade)이므로, 그 뒤는 단순 엣지로
-  `build_payload` 에 수렴한다. `publish_done` 은 항상 호출되어
-  성공/실패 한쪽 `JobDonePayload` 를 Redis Streams 에 게시한다.
+  `build_payload` 에 수렴한다. `publish_done` 은 항상 호출되어 성공/실패
+  한쪽 `JobDonePayload` 를 Redis Streams 에 게시한다.
   (각 노드도 `state["error"]` 를 보고 자체 no-op 하므로, 단축 분기는
   불필요한 LLM/HTTP 호출을 줄이는 최적화다.)
 
-체크포인터 (SoT B5):
+체크포인터:
   `build_graph(checkpointer=...)` 로 주입한다. None 이면 체크포인트 없이
   컴파일한다(단위 테스트·CHECKPOINT_ENABLED=false). 주입 시 `_run_job`
   은 `config={"configurable": {"thread_id": job_id}}` 로 invoke 해야 한다.
@@ -34,9 +55,13 @@ from langgraph.graph import END, START, StateGraph
 from app.nodes.agent_nodes import (
     AgentState,
     build_payload,
+    build_timeline,
     fetch_weather,
+    fit_time_budget,
     llm_reason,
+    load_given_places,
     parse_input,
+    plan_strategy,
     publish_done,
     recommend_places,
     recommend_route,
@@ -55,6 +80,15 @@ def _route_after(next_node: str):
     return _router
 
 
+def _route_after_weather(state: AgentState) -> str:
+    """날씨 다음 갈림길 — 장소를 찾을지, 받은 장소를 쓸지 고른다."""
+    if state.get("error"):
+        return "build_payload"
+    if state["request"].stage == "route":
+        return "load_given_places"
+    return "plan_strategy"
+
+
 def build_graph(checkpointer=None):
     """추천 파이프라인 노드를 연결한 컴파일된 StateGraph 인스턴스를 반환한다.
 
@@ -64,11 +98,15 @@ def build_graph(checkpointer=None):
     graph = StateGraph(AgentState)
     graph.add_node("parse_input", parse_input)
     graph.add_node("fetch_weather", fetch_weather)
+    graph.add_node("plan_strategy", plan_strategy)
+    graph.add_node("load_given_places", load_given_places)
     graph.add_node("search_places", search_places)
     graph.add_node("rules_filter", rules_filter)
     graph.add_node("score_and_rank", score_and_rank)
     graph.add_node("recommend_places", recommend_places)
     graph.add_node("recommend_route", recommend_route)
+    graph.add_node("build_timeline", build_timeline)
+    graph.add_node("fit_time_budget", fit_time_budget)
     graph.add_node("llm_reason", llm_reason)
     graph.add_node("build_payload", build_payload)
     graph.add_node("publish_done", publish_done)
@@ -79,11 +117,24 @@ def build_graph(checkpointer=None):
         _route_after("fetch_weather"),
         {"fetch_weather": "fetch_weather", "build_payload": "build_payload"},
     )
+    # 사용자가 방문지를 골라 온 요청(stage=route)은 탐색·선정 구간을 건너뛴다.
     graph.add_conditional_edges(
         "fetch_weather",
-        _route_after("search_places"),
+        _route_after_weather,
         {
-            "search_places": "search_places",
+            "plan_strategy": "plan_strategy",
+            "load_given_places": "load_given_places",
+            "build_payload": "build_payload",
+        },
+    )
+    # 전략은 계산으로 세우므로 실패할 일이 없다 — 단순 엣지로 탐색에 잇는다.
+    graph.add_edge("plan_strategy", "search_places")
+    # 장소가 이미 정해졌으므로 곧장 동선 단계로 합류한다.
+    graph.add_conditional_edges(
+        "load_given_places",
+        _route_after("recommend_route"),
+        {
+            "recommend_route": "recommend_route",
             "build_payload": "build_payload",
         },
     )
@@ -101,16 +152,22 @@ def build_graph(checkpointer=None):
             "build_payload": "build_payload",
         },
     )
-    # recommend_route 성공 시에만 llm_reason(이유·옷차림) 을 수행한다 —
-    # 실패 경로에서 LLM 호출 1회를 아끼고 곧장 실패 페이로드로 간다.
+    # recommend_route 성공 시에만 시간축을 세운다 — 실패 경로에서 hub 호출과
+    # LLM 호출을 아끼고 곧장 실패 페이로드로 간다.
     graph.add_conditional_edges(
         "recommend_route",
-        _route_after("llm_reason"),
+        _route_after("build_timeline"),
         {
-            "llm_reason": "llm_reason",
+            "build_timeline": "build_timeline",
             "build_payload": "build_payload",
         },
     )
+    # 두 시간축 노드는 실패해도 error 를 세우지 않는다(계산을 생략하고
+    # 표시만 남긴다). 그래서 뒤가 단순 엣지다 — 룰 노드와 같은 계약이다.
+    graph.add_edge("build_timeline", "fit_time_budget")
+    graph.add_edge("fit_time_budget", "llm_reason")
+    # llm_reason 은 실패해도 error 를 세우지 않고 저하 표시만 남기므로
+    # 단순 엣지로 합류 지점까지 직진한다.
     graph.add_edge("llm_reason", "build_payload")
     graph.add_edge("build_payload", "publish_done")
     graph.add_edge("publish_done", END)

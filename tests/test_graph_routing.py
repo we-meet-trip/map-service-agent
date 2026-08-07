@@ -59,7 +59,12 @@ class _FakeHub:
         self._places = places
 
     async def fetch_weather(self, province, city, date_start, date_end):
-        return {"daily": [{"date": "2026-07-06", "pop": 30}]}
+        return {
+            "daily": [
+                {"date": "2026-07-06", "precipitation_prob": 30}
+            ],
+            "missing_dates": [],
+        }
 
     async def search_places(
         self, province, city, *, mobility=None, keyword=None, size=15
@@ -74,6 +79,20 @@ class _FakeHub:
 
     async def score_indoor_bonus(self, pois, day_pop_max):
         return {"scored": []}
+
+    async def estimate_dwell(self, places):
+        # 체류시간은 hub 룰이 정한다. 여기서는 요청한 장소마다 같은 값을
+        # 돌려주어 시각 계산이 결정적으로 돌아가게만 한다.
+        return {
+            "estimates": [
+                {
+                    "content_id": p["content_id"],
+                    "stay_minutes": 30,
+                    "source": "category",
+                }
+                for p in places
+            ]
+        }
 
     async def fetch_reviews(self, query, *, display=3):
         return {"reviews": [], "count": 0, "query": query}
@@ -117,7 +136,7 @@ def _invoke(req: AgentRequest, hub, gemini) -> tuple[dict, _CapturePublisher]:
 def _selection(n: int) -> PlacesSelection:
     return PlacesSelection(
         selections=[
-            PlaceSelection(index=i, recommended_visit_time="오전")
+            PlaceSelection(index=i, day=1, recommended_visit_time="오전")
             for i in range(n)
         ]
     )
@@ -148,14 +167,15 @@ def _reasons(n: int) -> ReasonEnvelope:
     )
 
 
-def test_happy_path_exactly_three_llm_calls() -> None:
-    """정상 경로: selection→route→reason 3회 호출, done 페이로드 완성."""
-    gemini = _SeqGemini([_selection(2), _route(2), _reasons(2)])
+def test_happy_path_uses_two_llm_calls() -> None:
+    """정상 경로: selection→reason 2회 호출, done 페이로드 완성."""
+    gemini = _SeqGemini([_selection(2), _reasons(2)])
     out, pub = _invoke(
         _request(), _FakeHub([_candidate(0), _candidate(1)]), gemini
     )
-    assert gemini.calls == 3
-    assert out["llm_calls_used"] == 3
+    # 동선은 계산으로 만든다 — 남는 LLM 은 선정과 이유 둘뿐이다.
+    assert gemini.calls == 2
+    assert out["llm_calls_used"] == 2
     assert out.get("error") is None
     payload = pub.payloads[0]
     assert payload["status"] == "done"
@@ -182,58 +202,67 @@ def test_parse_error_short_circuits_no_llm() -> None:
     assert "date_start" in payload["error"]
 
 
-def test_route_failure_skips_llm_reason() -> None:
-    """route 검증 실패: llm_reason 미경유(LLM 2회), failed 페이로드."""
-    # visit_order 가 순열이 아님 → recommend_route 에서 error
-    bad_route = RouteEnvelope(visit_order=[0, 0], legs=[
-        Leg.model_validate(
-            {
-                "from": 0,
-                "to": 0,
-                "mode": "walk",
-                "estimated_distance_km": 1.0,
-                "estimated_duration_min": 10,
-            }
-        )
-    ])
-    gemini = _SeqGemini([_selection(2), bad_route, _reasons(2)])
-    out, pub = _invoke(
-        _request(), _FakeHub([_candidate(0), _candidate(1)]), gemini
-    )
-    assert gemini.calls == 2  # reason 호출 없음
-    payload = pub.payloads[0]
-    assert payload["status"] == "failed"
-    assert "permutation" in payload["error"]
+def test_route_is_computed_not_asked() -> None:
+    """방문 순서와 구간은 모델에게 묻지 않고 계산으로 만든다.
 
-
-def test_route_leg_connectivity_mismatch_fails() -> None:
-    """legs[i] 가 visit_order[i]→[i+1] 를 잇지 않으면 실패한다.
-
-    순열·길이는 유효하지만 구간 연결이 뒤집힌 응답(1→0)을 준다 —
-    연결성 검증(agent_nodes.recommend_route)이 없으면 통과해버리는
-    케이스로, 해당 검증의 회귀를 방지한다.
+    전에는 모델이 순열·구간을 지어내고 코드가 5중으로 검증했다. 하나라도
+    어긋나면 잡 전체가 실패했고, 장소가 늘수록 그 확률이 올라갔다. 이제는
+    계약이 성립하는 값을 처음부터 만들어 실패 자체가 생기지 않는다.
     """
-    disconnected = RouteEnvelope(visit_order=[0, 1], legs=[
-        Leg.model_validate({
-            "from": 1, "to": 0,  # 역방향 — visit_order[0]→[1] 이어야 함
-            "mode": "walk",
-            "estimated_distance_km": 1.0,
-            "estimated_duration_min": 10,
-        })
-    ])
-    gemini = _SeqGemini([_selection(2), disconnected, _reasons(2)])
+    gemini = _SeqGemini([_selection(4), _reasons(4)])
     out, pub = _invoke(
-        _request(), _FakeHub([_candidate(0), _candidate(1)]), gemini
+        _request(),
+        _FakeHub([_candidate(i) for i in range(4)]),
+        gemini,
     )
-    assert gemini.calls == 2  # llm_reason 미경유
+
+    assert gemini.calls == 2
     payload = pub.payloads[0]
-    assert payload["status"] == "failed"
-    assert "must connect" in payload["error"]
+    assert payload["status"] == "done"
+    order = payload["visit_order"]
+    # 순열이다 — 모든 장소를 정확히 한 번씩 지난다.
+    assert sorted(order) == [0, 1, 2, 3]
+    # 구간 수 계약과 연결성이 계산 단계에서 이미 보장된다.
+    assert len(payload["legs"]) == len(order) - 1
+    for i, leg in enumerate(payload["legs"]):
+        assert leg["from"] == order[i]
+        assert leg["to"] == order[i + 1]
+
+
+def test_route_groups_days_in_ascending_order() -> None:
+    """여러 날 일정은 일차끼리 묶여 오름차순으로 이어진다."""
+    gemini = _SeqGemini([
+        PlacesSelection(selections=[
+            PlaceSelection(index=0, day=2, recommended_visit_time="오전"),
+            PlaceSelection(index=1, day=1, recommended_visit_time="오전"),
+            PlaceSelection(index=2, day=2, recommended_visit_time="오후"),
+            PlaceSelection(index=3, day=1, recommended_visit_time="오후"),
+        ]),
+        _reasons(4),
+    ])
+    req = _request(
+        date=DateRange(
+            date_start=date(2026, 7, 6),
+            date_end=date(2026, 7, 7),
+            time_start=time(9, 0),
+            time_end=time(18, 0),
+        )
+    )
+    out, pub = _invoke(
+        req, _FakeHub([_candidate(i) for i in range(4)]), gemini
+    )
+
+    payload = pub.payloads[0]
+    assert payload["status"] == "done"
+    by_id = {p["place_id"]: p for p in payload["places"]}
+    days = [by_id[pid]["day"] for pid in payload["visit_order"]]
+    # 1일차가 전부 나온 뒤 2일차가 나온다.
+    assert days == sorted(days)
 
 
 def test_reason_degrade_still_done() -> None:
     """llm_reason 실패(타임아웃)여도 잡은 done 으로 발행된다."""
-    gemini = _SeqGemini([_selection(2), _route(2), asyncio.TimeoutError()])
+    gemini = _SeqGemini([_selection(2), asyncio.TimeoutError()])
     out, pub = _invoke(
         _request(), _FakeHub([_candidate(0), _candidate(1)]), gemini
     )

@@ -45,6 +45,32 @@ def _reject_tags_and_control(value):
     return value
 
 
+# bullets 1줄의 길이 상한. 블로그 요약은 카드 UI 두 줄에 들어가야 하므로
+# reason(200자)보다 짧게 잡는다.
+BULLET_MAX_LEN = 80
+
+
+def _reject_tags_and_control_list(value):
+    """문자열 리스트의 모든 원소에 `_reject_tags_and_control` 을 적용한다.
+
+    bullets 처럼 리스트 필드는 원소 단위 검증이 필요하다(Field 제약만으로는
+    항목 내부 문자를 막지 못한다). 길이 상한도 함께 본다 — 리뷰 원문이
+    그대로 새어 나오는 것(요약이 아닌 발췌)을 막는 실질 장치다.
+    """
+    if value is None:
+        return value
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("bullet must be a string")
+        stripped = item.strip()
+        if not stripped:
+            raise ValueError("bullet must not be blank")
+        if len(item) > BULLET_MAX_LEN:
+            raise ValueError(f"bullet exceeds {BULLET_MAX_LEN} characters")
+        _reject_tags_and_control(item)
+    return value
+
+
 class Mobility(str, Enum):
     """이동 수단 enum — 추천 동선이 가정하는 이동 모드.
 
@@ -52,6 +78,9 @@ class Mobility(str, Enum):
 
     walk: 도보.
     bicycle: 자전거.
+    scooter: 전동 킥보드. kickboard 와 같은 개념이며 hub 룰이 두 철자를 모두
+        받는다. 반경은 자전거와 같지만 소요시간 보정 계수와 경로 프로파일이
+        달라, bicycle 로 치환하지 않고 별도 값으로 전달해야 한다.
     car: 자가용/택시 등 자동차.
     transit: 대중교통(버스/지하철 등).
 
@@ -63,6 +92,7 @@ class Mobility(str, Enum):
     """
     walk = "walk"
     bicycle = "bicycle"
+    scooter = "scooter"
     car = "car"
     transit = "transit"
 
@@ -85,6 +115,48 @@ class DateRange(BaseModel):
     time_end: time
 
 
+class SelectedPlace(BaseModel):
+    """사용자가 직접 고른 방문지 1건 — stage="route" 요청의 입력.
+
+    사용자가 지도에서 장소를 골라 오면 후보 탐색·선정 단계를 건너뛰고 이
+    목록으로 바로 동선을 짠다. 그래서 좌표는 필수다(동선을 그릴 수 없다).
+
+    name: 장소명. 1~80자.
+    address: 주소. 표시용이라 동선 계산에 쓰이지 않는다. 키를 생략해도,
+             값이 null 로 와도 빈 문자열로 접는다 — 호출 측이 주소 없는
+             지점(지도에서 찍은 좌표 등)을 그대로 보낼 수 있어야 한다.
+    lat/lng: 좌표. 국내 범위 밖이면 검증 실패.
+    day: 이 장소를 방문할 여행 일차(1부터). 호출 측이 일차별로 장소를
+         골랐을 때 그 묶음을 그대로 전달하는 통로다. 키를 생략해도, 값이
+         null 로 와도 1일차로 접는다 — 일차 구분 없이 고른 호출도 그대로
+         받아야 한다.
+    content_id: 실측 출처 식별자. 있으면 리뷰 조회에 그대로 쓰고, 없으면
+                이름으로 조회한다.
+    """
+    name: str = Field(min_length=1, max_length=80)
+    address: str = Field(default="", max_length=200)
+    lat: float = Field(ge=33.0, le=43.0)
+    lng: float = Field(ge=124.0, le=132.0)
+    day: int = Field(default=1, ge=1)
+    content_id: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("day", mode="before")
+    @classmethod
+    def _first_day_when_null(cls, value):
+        """일차 키가 없거나 null 이면 1일차로 접는다."""
+        return 1 if value is None else value
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def _blank_when_null(cls, value):
+        """JSON `"address": null` 을 빈 문자열로 접는다."""
+        return "" if value is None else value
+
+    _no_tags = field_validator("name", "address", "content_id")(
+        _reject_tags_and_control
+    )
+
+
 class AgentRequest(BaseModel):
     """추천 요청 본문 — `/v1/recommend` POST 의 body.
 
@@ -95,15 +167,20 @@ class AgentRequest(BaseModel):
     mobility: 선호 이동 수단(`Mobility`). 없을 수 있음.
     province: 광역 행정구역(예: "서울특별시"). 1~20자.
     city: 시/군/구(예: "강남구"). 1~20자.
-    schedule_id: user-BFF 의 일정 식별자(SoT §6.1 B2 body). 추적/영속화
+    schedule_id: user-BFF 의 일정 식별자. 추적/영속화
                  연계용 패스스루 — agent 는 user_service 스키마를 읽지
                  않으므로 이 값으로 조회하지 않는다. nullable.
-    stage: 추천 단계. "init"(초기 추천) 또는 "mode1"(재탐색, SoT §6.2).
+    stage: 추천 단계.
+           "init"  — 조건만 받아 장소 탐색부터 하는 초기 추천.
+           "mode1" — 일부 장소를 빼고 다시 뽑는 재탐색.
+           "route" — 사용자가 places 로 고른 장소들의 동선만 짠다.
            기본 "init" — 기존 호출자 하위호환.
-    exclude: Mode 1 재탐색 시 재추천을 금지할 content_id 목록
-             (SoT §6.2 exclude_list). grounded 후보 필터에 사용된다.
-             invent(LLM 생성) 폴백에는 content_id 가 없어 적용 불가 —
-             한계는 search_places docstring 참조.
+    exclude: Mode 1 재탐색 시 재추천을 금지할 content_id 목록.
+             grounded 후보 필터에 사용된다. invent(LLM 생성) 폴백에는
+             content_id 가 없어 적용 불가 — 한계는 search_places docstring 참조.
+    places: stage="route" 에서 사용자가 고른 방문지 목록. 2~10개.
+            다른 stage 에서는 무시된다. 2개 미만이면 이을 구간이 없고,
+            10개를 넘으면 동선 프롬프트가 감당하기 어려워 상한을 둔다.
 
     호출 흐름:
       클라이언트 → `app.main.recommend(req)` → `_run_job` →
@@ -117,10 +194,13 @@ class AgentRequest(BaseModel):
     province: str = Field(min_length=1, max_length=20)
     city: str = Field(min_length=1, max_length=20)
     schedule_id: Optional[str] = Field(default=None, max_length=64)
-    stage: Literal["init", "mode1"] = "init"
+    stage: Literal["init", "mode1", "route"] = "init"
     exclude: Optional[
         List[Annotated[str, Field(min_length=1, max_length=64)]]
     ] = Field(default=None, max_length=50)
+    places: Optional[List[SelectedPlace]] = Field(
+        default=None, min_length=2, max_length=10
+    )
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -151,6 +231,8 @@ class Place(BaseModel):
       populate_by_name=True — 필드명 직접 입력과 alias 입력 모두 허용.
 
     place_id: 장소 식별자(정수). `recommend_places` 노드가 0..N-1 로 정규화한다.
+    day: 여행 일차(1부터 시작). LLM 이 `_build_places_prompt` 지시에 따라
+         날짜 범위 안에서 직접 배정한다. 1..num_days 범위를 벗어나면 검증 실패.
     name: 장소명.
     address: 주소 문자열.
     lat: 위도. ge=33.0, le=43.0 — 한국 국내 위도 범위 밖이면 검증 실패.
@@ -160,11 +242,13 @@ class Place(BaseModel):
     사용처:
       - LLM 응답 검증의 단위 모델(`PlacesEnvelope.places` 원소).
       - `Leg.from_place_id` / `Leg.to_place_id` 가 본 `place_id` 를 참조.
-      - `JobDonePayload.places` 의 원소.
+      - `JobDonePayload.places` 의 원소. user(BFF) 가 이 `day` 를 그대로
+        `TripStop.day` 로 전달해 client 가 일차별 탭을 그린다.
     """
     model_config = ConfigDict(populate_by_name=True)
 
     place_id: int
+    day: int = Field(ge=1)
     name: str = Field(min_length=1, max_length=80)
     address: str = Field(max_length=200)
     lat: float = Field(ge=33.0, le=43.0)
@@ -197,12 +281,38 @@ class Place(BaseModel):
     route_idx: Optional[str] = None
     # 외부 실측 후보에 근거해 만든 장소면 True, LLM 단독 생성이면 False.
     grounded: bool = True
-    # llm_reason 노드가 병합하는 장소별 추천 이유(SoT §3 agent 책임).
+    # ── 시간축 ────────────────────────────────────────────────────
+    # 아래 셋은 build_timeline 이 계산해 build_payload 에서 병합한다. 전부
+    # 선택값인 이유는 두 가지다 — 시간축 도입 전에 저장된 페이로드가 그대로
+    # 검증을 통과해야 하고, 타임라인 계산이 저하되면 값 없이도 일정이 나가야
+    # 하기 때문이다.
+    #
+    # stay_minutes: 이 장소에 머무는 시간(분). hub 룰이 분류로 추정한다.
+    #     숙박처럼 일정 시간에 넣지 않는 분류는 0 이다.
+    # visit_start / visit_end: 확정된 방문 시각("HH:MM"). 하루 활동 시작
+    #     시각에서 출발해 이동시간과 체류시간을 누적해 얻는다.
+    #     기존 recommended_visit_time(자유 텍스트)과 의미가 다르므로 그 필드를
+    #     대체하지 않고 나란히 둔다.
+    # stay_source: 체류시간을 어디서 얻었는지. course_actual|category|default.
+    stay_minutes: Optional[int] = Field(default=None, ge=0, le=1440)
+    visit_start: Optional[str] = Field(default=None, max_length=5)
+    visit_end: Optional[str] = Field(default=None, max_length=5)
+    stay_source: Optional[str] = Field(default=None, max_length=16)
+
+    # llm_reason 노드가 병합하는 장소별 추천 이유.
     # LLM 응답(ReasonEnvelope)에서 검증을 거친 값만 들어온다. 생성
     # 시점에는 없다가 build_payload 에서 model_copy 로 채워진다.
     reason: Optional[str] = Field(default=None, max_length=200)
+    # summarize_reviews 노드가 병합하는 장소별 블로그 리뷰 요약(2줄).
+    # 네이버 블로그 검색 스니펫을 LLM 이 종합한 결과이며, 원문 스니펫은
+    # 페이로드에 싣지 않는다(간접 인젝션 노출면 최소화). reason 과 같은
+    # 방식으로 생성 후 build_payload 에서 model_copy 로 채워진다.
+    bullets: Optional[List[str]] = Field(default=None, max_length=2)
 
     _no_tags_reason = field_validator("reason")(_reject_tags_and_control)
+    _no_tags_bullets = field_validator("bullets")(
+        _reject_tags_and_control_list
+    )
 
 
 class Leg(BaseModel):
@@ -255,9 +365,12 @@ class PlaceSelection(BaseModel):
     """grounded 경로에서 LLM 이 고른 후보 1건.
 
     index: 후보 목록에서 선택한 항목의 0 기반 인덱스.
+    day: 해당 장소를 방문할 여행 일차(1부터). 여행 일수를 넘는 값은
+         `_select_places` 가 그 선택만 건너뛴다.
     recommended_visit_time: 해당 장소의 권장 방문 시간 텍스트.
     """
     index: int = Field(ge=0)
+    day: int = Field(ge=1)
     recommended_visit_time: str = Field(max_length=50)
 
     _no_tags = field_validator("recommended_visit_time")(
@@ -307,6 +420,109 @@ class ReasonEnvelope(BaseModel):
     _no_tags = field_validator("clothing")(_reject_tags_and_control)
 
 
+class PlaceBullets(BaseModel):
+    """`summarize_reviews` 응답의 장소별 블로그 요약 1건.
+
+    place_id: 대상 장소의 place_id. `summarize_reviews` 노드가 유효 id
+              집합의 부분집합인지·무중복인지 semantic 검증한다.
+    bullets: 요약 줄. 각 줄은 1..BULLET_MAX_LEN 자, 태그/제어문자 금지.
+             하류 계약은 "정확히 2줄"이지만 스키마는 1~4줄을 받는다 —
+             줄 수를 스키마로 못 박으면 모델이 3줄을 쓴 순간 응답 전체가
+             검증에 걸려 모든 장소의 요약이 함께 사라진다. 개수 정규화는
+             노드가 맡아(2줄 미만 항목 폐기, 초과분 절단) 일부만 어긋난
+             경우에도 나머지 장소는 살린다.
+    """
+    place_id: int
+    bullets: List[str] = Field(min_length=1, max_length=4)
+
+    _no_tags = field_validator("bullets")(_reject_tags_and_control_list)
+
+
+class BulletsEnvelope(BaseModel):
+    """`summarize_reviews` 단계에서 LLM 이 돌려주는 구조화 응답의 루트.
+
+    items: 장소별 요약 리스트. 리뷰 스니펫을 확보한 장소만 대상이므로
+           요청한 장소 전부가 오지 않을 수 있다(부분 커버리지 허용).
+
+    사용처:
+      - `GeminiClient.generate_structured(prompt, BulletsEnvelope)` 의
+        `response_schema` (summarize_reviews 노드, LLM 4번째 호출).
+    """
+    items: List[PlaceBullets]
+
+
+class ReviewSnippet(BaseModel):
+    """요약 요청에 실려 오는 블로그 후기 한 건.
+
+    호출 측이 이미 받아 둔 후기를 그대로 넘겨준다. 여기서 다시 조회하지
+    않는 이유는, 같은 후기를 두 번 받으면 외부 호출이 두 배가 되고 화면에
+    보이는 목록과 요약의 근거가 어긋날 수 있기 때문이다.
+
+    title: 글 제목. 없어도 되지만 있으면 요약 품질에 도움이 된다.
+    description: 본문 발췌. 요약의 실질적 근거다.
+    """
+    title: str = Field(default="", max_length=200)
+    description: str = Field(min_length=1, max_length=500)
+
+
+class SummaryPlaceRequest(BaseModel):
+    """요약 요청에 실리는 장소 한 건.
+
+    place_name: 요약 대상 장소명. 프롬프트에 장소를 지목하는 데 쓴다.
+    category: 분류 텍스트. 없으면 생략한다.
+    reviews: 요약 근거가 될 후기 묶음. 1건도 없으면 요약할 것이 없고,
+             너무 많으면 프롬프트가 비대해져 상한을 둔다.
+
+    단건 요청과 배치 요청이 같은 상한을 쓰도록 한 곳에 모아 둔다.
+    """
+    place_name: str = Field(min_length=1, max_length=80)
+    category: Optional[str] = Field(default=None, max_length=80)
+    reviews: List[ReviewSnippet] = Field(min_length=1, max_length=7)
+
+
+class ReviewsSummaryRequest(SummaryPlaceRequest):
+    """`POST /v1/reviews/summary` 요청 본문 — 장소 한 곳."""
+
+
+class ReviewsSummaryResponse(BaseModel):
+    """`POST /v1/reviews/summary` 응답 본문.
+
+    bullets: 요약 두 줄. 근거가 부족하거나 모델 응답이 형식을 벗어나면
+             빈 목록으로 온다 — 호출 측은 이때 요약 영역을 접는다.
+    """
+    bullets: List[str] = Field(default_factory=list, max_length=2)
+
+
+class ReviewsSummaryBatchRequest(BaseModel):
+    """`POST /v1/reviews/summary/batch` 요청 본문.
+
+    places: 요약 대상 장소 묶음. 한 번의 모델 호출에 담을 수 있는 만큼만
+            받는다. 목록이 더 길면 호출 측이 나눠 보낸다 — 여기서 조용히
+            잘라 내면 뒤쪽 장소가 요약을 못 받은 사실이 드러나지 않는다.
+    """
+    places: List[SummaryPlaceRequest] = Field(min_length=1, max_length=7)
+
+
+class PlaceSummaryResult(BaseModel):
+    """배치 응답의 장소 1건.
+
+    index: 요청 `places` 배열에서의 위치. 한 일정에 같은 이름이 두 번 나올
+           수 있어 이름으로는 어느 장소의 요약인지 가릴 수 없다.
+    bullets: 요약 두 줄.
+    """
+    index: int = Field(ge=0)
+    bullets: List[str] = Field(max_length=2)
+
+
+class ReviewsSummaryBatchResponse(BaseModel):
+    """`POST /v1/reviews/summary/batch` 응답 본문.
+
+    results: 두 줄을 채운 장소만 담는다. 근거를 구하지 못한 장소는 목록에서
+             빠진다 — 부분 커버리지는 오류가 아니라 정상 결과다.
+    """
+    results: List[PlaceSummaryResult] = Field(default_factory=list)
+
+
 class RouteEnvelope(BaseModel):
     """`recommend_route` 단계에서 LLM 이 돌려주는 구조화 응답의 루트.
 
@@ -327,11 +543,20 @@ class JobDonePayload(BaseModel):
 
     job_id: 어떤 잡의 결과인지 식별.
     status: Literal["done", "failed"]. 둘 중 하나만 허용.
-    places: 성공 시 추천 장소 리스트(장소별 reason 포함 가능). 실패 시 None.
+    places: 성공 시 추천 장소 리스트(장소별 reason·bullets 포함 가능).
+            실패 시 None.
     visit_order: 성공 시 방문 순서. 실패 시 None.
     legs: 성공 시 동선 구간 리스트. 실패 시 None.
     clothing: 성공 시 날씨 기반 옷차림 안내(llm_reason 산출). llm_reason
               이 degrade 로 생략되면 None 일 수 있다.
+    timeline_status: 시간축이 어떻게 정해졌는지. 소비자가 값의 신뢰도를
+              가늠하는 데 쓴다.
+                ok        — 하루 활동 시간 안에 그대로 들어갔다
+                trimmed   — 넘쳐서 체류시간을 줄이거나 뒤 장소를 덜어 냈다
+                unverified— 계산을 하지 못했다(저하). 시각 필드가 비어 있다
+              시간축 도입 전 페이로드에는 이 키가 없다.
+    warnings: 사용자에게 알려야 하는 한계. 예를 들어 영업시간을 확인할 수
+              있는 출처가 없어 "그 시각에 문이 열려 있는지"는 보장하지 못한다.
     error: 실패 시 사유 텍스트. 성공 시 None.
 
     직렬화:
@@ -349,4 +574,8 @@ class JobDonePayload(BaseModel):
     visit_order: Optional[List[int]] = None
     legs: Optional[List[Leg]] = None
     clothing: Optional[str] = None
+    timeline_status: Optional[
+        Literal["ok", "trimmed", "unverified"]
+    ] = None
+    warnings: Optional[List[str]] = None
     error: Optional[str] = None

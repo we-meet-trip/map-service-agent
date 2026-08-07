@@ -23,16 +23,20 @@ class AgentSettings(BaseSettings):
       GEMINI_API_KEY: 비밀값(SecretStr). 기본 빈 문자열.
                       lifespan 진입 시 비어 있으면 RuntimeError 로 부팅 중단.
       GEMINI_MODEL: 모델 이름 문자열. GeminiClient 생성 시 전달.
-      GEMINI_RPM_LIMIT: 분당 호출 상한(외부 API 한도, SoT §10). token-bucket
+      GEMINI_RPM_LIMIT: 분당 호출 상한(외부 API 가 정한 값). token-bucket
                         용량/리필률로 사용된다.
-      GEMINI_RPD_LIMIT: 일일 호출 상한(외부 API 한도 250, 문서화 목적).
+      GEMINI_RPD_LIMIT: 외부 API 의 일일 상한(250, 문서화 목적).
                         실제 집행은 GEMINI_RPD_CAP 이 담당한다.
-      GEMINI_RPD_CAP: agent 자체 일일 상한(SoT R-01: 200/일, 50은 데모 예비).
+      GEMINI_RPD_CAP: agent 자체 일일 상한(200/일). 외부 한도보다 낮게 잡아
+                      50 회를 수동 점검·데모용 예비로 남긴다.
                       GeminiRateLimiter 의 일일 카운터가 KST 자정 기준으로
                       집행한다.
-      GEMINI_MAX_CALLS_PER_REQUEST: 추천 요청 1건당 LLM 호출 하드 예산
-                      (SoT §2.3 "요청당 LLM ≤ 3회"). 교정 재시도 포함
-                      모든 호출이 본 예산을 소비한다.
+      GEMINI_MAX_CALLS_PER_REQUEST: 추천 요청 1건당 LLM 호출 하드 예산.
+                      교정 재시도 포함 모든 호출이 본 예산을 소비한다.
+                      정상 경로 소비 내역: 장소 선정 1 + 동선 1 +
+                      추천이유 1 = 3. 블로그 요약은 추천 파이프라인에서
+                      빠져 별도 파이프라인이 자기 예산
+                      (SUMMARY_MAX_LLM_CALLS)으로 돈다.
       GEMINI_TEMPERATURE: 생성 온도. 구조화 출력의 결정성을 위해 낮게 둔다.
       GEMINI_MAX_OUTPUT_TOKENS: 응답 토큰 상한. Gemini 2.5 계열은 thinking
                       토큰이 본 상한을 함께 소비하므로 과소 설정 시 JSON 이
@@ -94,43 +98,68 @@ class AgentSettings(BaseSettings):
                      블로그 리뷰 스니펫을 붙여 선정/이유 프롬프트를 보강한다.
                      리뷰 수집은 best-effort(실패해도 잡을 죽이지 않는다)이며
                      LLM 호출을 추가하지 않는다(hub HTTP 만 추가).
-      REVIEWS_MAX_PLACES: 리뷰를 조회할 상위 후보 수(SoT §7.1 추천당 2-5회
-                     이내). 랭킹 상위 K 개에만 조회한다.
+      REVIEWS_MAX_PLACES: 선정 단계에서 리뷰를 조회할 상위 후보 수.
+                     랭킹 상위 K 개에만 조회해 hub 왕복을 억제한다.
       REVIEWS_DISPLAY: 후보 1건당 hub 에 요청하는 리뷰 수(display).
+                     여러 글을 교차 대조할 수 있도록 5로 둔다. 선정·이유
+                     프롬프트 뷰는 이 중 앞 2건만 쓴다(토큰 절약).
+      REVIEWS_FETCH_CAP_PER_JOB: 잡 1건이 hub `/v1/reviews` 를 호출할 총
+                     상한. 선정 단계가 상위 후보만 조회하므로 실제로는
+                     여유가 남는 안전망이다 — 장소 수에 비례해 외부 API
+                     호출이 무한히 늘어나는 것을 막는다. hub 가 6시간
+                     캐시를 두므로 같은 장소 재조회는 외부 API 호출로
+                     이어지지 않는다.
+
+    블로그 요약 파이프라인 관련:
+      SUMMARY_ENABLED: True(기본)면 요약 엔드포인트가 파이프라인을 돌려
+                     장소별 요약 2줄(bullets)을 만든다. False 면 파이프라인을
+                     부르지 않고 빈 결과를 돌려준다(kill-switch — 쿼터
+                     압박·품질 회귀 시 즉시 무력화). 빈 요약은 호출 측이
+                     캐시하지 않으므로 되돌리면 즉시 정상 동작한다.
+      SUMMARY_MAX_PLACES: 한 번에 요약할 최대 장소 수. 프롬프트에 실리는
+                     스니펫 총량의 운영 상한이며, 요청 스키마의 상한과
+                     별개로 배포 없이 낮출 수 있는 조절값이다.
+      SUMMARY_MAX_LLM_CALLS: 요약 요청 1건당 LLM 호출 예산. 본 호출 1회 +
+                     응답이 형식을 벗어났을 때의 교정 재시도 1회로 2를
+                     둔다. 추천 파이프라인의 예산과 분리돼 있어 요약이
+                     추천 잡의 호출 여유를 잠식하지 않는다.
 
     룰 엔진(hub `/v1/rules/*`) 관련:
       RULES_ENABLED: True(기본)면 rules_filter/score_and_rank 가 hub 룰
                      엔드포인트를 호출해 반경 필터·실내 보너스 랭킹을
                      적용한다. False 면 두 노드가 no-op pass-through 로
                      복귀한다(kill-switch — hub 장애/회귀 시 즉시 무력화).
+      TIMELINE_ENABLED: True(기본)면 build_timeline 이 hub 체류시간 룰로
+                     방문 시각을 계산하고, 하루 활동 시간을 넘치면
+                     fit_time_budget 이 결정적으로 줄인다. False 면 두 노드가
+                     통과만 해 페이로드가 시간축 도입 전과 같아진다.
+      TIMELINE_BUFFER_MINUTES: 장소 사이에 두는 여유(분).
 
     Redis Streams 관련:
       REDIS_URL: redis 접속 URL.
-      REDIS_DB_STREAMS: streams 발행용 DB 번호(논리적 분리).
-                        user-service 컨슈머(redis.db-streams, 기본 2)와
-                        일치해야 한다. SoT §8.3 은 DB3 로 표기하나 실측
-                        양측 합의값은 DB2 — amendment 로 SoT 정정 예정
-                        (사용자 결정 2026-07-05).
+      REDIS_DB_STREAMS: streams 발행용 DB 번호(논리적 분리). 기본 2.
+                        user-service 컨슈머(redis.db-streams)와 반드시
+                        같은 값이어야 한다 — 어긋나면 발행은 성공하는데
+                        소비자가 영원히 빈 stream 을 읽는다.
       STREAM_NAME: 잡 완료 페이로드를 발행할 stream 이름.
       STREAM_MAXLEN: 0 보다 크면 XADD 시 approximate trim 으로 stream
                      길이를 본 값 근처로 제한한다(메모리 무한 누적 방지).
       STATUS_STREAM_NAME: 노드 진행 이벤트를 발행할 stream 이름
-                          (SoT §4.5 `agent:jobs:status`). done 스트림과
-                          동일 DB(REDIS_DB_STREAMS)에 둔다.
+                          (`agent:jobs:status`). done 스트림과 동일
+                          DB(REDIS_DB_STREAMS)에 둔다.
       STATUS_STREAM_MAXLEN: status stream 의 approximate trim 상한.
       REDIS_DB_RATELIMIT: Gemini token-bucket/일일 카운터 전용 DB 번호
-                          (SoT §8.3 DB3: rate-limit 정책 그룹).
+                          (기본 3 — rate-limit 정책 키를 한 DB 에 모은다).
 
     LangGraph 체크포인터(Postgres) 관련:
       CHECKPOINT_ENABLED: True 면 lifespan 이 Postgres 체크포인터를
-                          배선한다(SoT B5). 연결 실패 시 부팅 중단
-                          (fail-fast, 사용자 결정 2026-07-05).
+                          배선한다. 연결 실패 시 부팅 중단(fail-fast).
                           False 면 체크포인터 없이 compile.
       POSTGRES_HOST / POSTGRES_PORT / POSTGRES_DB / POSTGRES_USER:
                           체크포인터 접속 정보.
       POSTGRES_PASSWORD: 비밀값(SecretStr).
       LANGGRAPH_SCHEMA: 체크포인트 테이블이 거주할 schema 이름
-                        (SoT §8.1: `langgraph`, agent 전용).
+                        (`langgraph`, agent 전용).
 
     잡 타이밍:
       JOB_TIMEOUT_SECONDS: 잡 1건의 전체 실행 한도. `_run_job` 의
@@ -140,13 +169,20 @@ class AgentSettings(BaseSettings):
                            GEMINI_TIMEOUT_SECONDS=100s) 는 이론최악이나,
                            본 wall-clock 캡이 잡 전체를 300s 에서 강제
                            종료하므로 300s 를 넘지 않는다. 정상 경로는
-                           수십 초 내 완료. SoT B2 예산(10분=600s) 내.
+                           수십 초 내 완료. BFF 가 허용하는 잡 대기
+                           상한(10분) 안에 들어온다.
       GEMINI_TIMEOUT_SECONDS: Gemini 호출 1건의 한도. GeminiClient 내부
                               `generate_text` / `generate_structured` 가
                               `asyncio.wait_for` 로 강제.
       SHUTDOWN_GRACE_SECONDS: lifespan 종료 시 진행 중 백그라운드 잡들이
                               마무리되길 기다리는 한도. 초과하면 cancel.
                               JOB_TIMEOUT_SECONDS + 10s 로 연동한다.
+
+    관측(로깅):
+      LOG_LEVEL: 루트 로거 레벨. uvicorn 은 자기 로거만 구성하고 루트
+                 로거에는 핸들러를 붙이지 않으므로, `app/main.py` 의
+                 `_configure_logging` 이 부팅 시 루트 핸들러가 비어 있을
+                 때만 stdout 핸들러를 붙여 `app.*` 로그를 살린다.
     """
 
     model_config = SettingsConfigDict(
@@ -174,10 +210,28 @@ class AgentSettings(BaseSettings):
     AUTH_ENFORCED: bool = False
 
     REVIEWS_ENRICH_ENABLED: bool = True
-    REVIEWS_MAX_PLACES: int = 3  # SoT §7.1 추천당 2-5회 이내
-    REVIEWS_DISPLAY: int = 3
+    REVIEWS_MAX_PLACES: int = 3
+    REVIEWS_DISPLAY: int = 5  # hub 가 받는 상한은 10
+    # 선정 단계는 상위 후보(REVIEWS_MAX_PLACES)만 조회하므로 실제 소비는 이
+    # 값에 한참 못 미친다. 장소 수에 비례해 호출이 늘어나지 않게 막는 안전망.
+    REVIEWS_FETCH_CAP_PER_JOB: int = 10
+
+    SUMMARY_ENABLED: bool = True
+    # 한 요청에 담을 장소 수 상한. 요청 스키마의 상한과 같은 값으로 두되,
+    # 배포 없이 낮출 수 있도록 설정으로 분리해 둔다.
+    SUMMARY_MAX_PLACES: int = 7
+    # 본 호출 1 + 형식 이탈 시 교정 재시도 1.
+    SUMMARY_MAX_LLM_CALLS: int = 2
 
     RULES_ENABLED: bool = True  # kill-switch — 장애 시 no-op 복귀
+
+    # 시간축(체류시간·방문 시각) 산출 스위치. False 면 build_timeline 과
+    # fit_time_budget 이 no-op 으로 통과해 페이로드가 도입 전과 같아진다.
+    TIMELINE_ENABLED: bool = True
+    # 한 장소와 다음 장소 사이에 두는 여유(분). 길 찾기·주차·대기처럼
+    # 이동시간에 잡히지 않는 시간을 흡수한다. 0 으로 두면 일정이 분 단위로
+    # 빈틈없이 붙어 실제로 지킬 수 없는 시간표가 된다.
+    TIMELINE_BUFFER_MINUTES: int = 10
 
     REDIS_URL: str = "redis://redis:6379"
     REDIS_DB_STREAMS: int = 2
@@ -198,6 +252,8 @@ class AgentSettings(BaseSettings):
     JOB_TIMEOUT_SECONDS: float = 300.0
     GEMINI_TIMEOUT_SECONDS: float = 100.0
     SHUTDOWN_GRACE_SECONDS: float = 310.0
+
+    LOG_LEVEL: str = "INFO"
 
 
 # _settings

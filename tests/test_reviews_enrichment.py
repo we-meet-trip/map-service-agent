@@ -137,8 +137,13 @@ def test_reviews_all_non_string_yields_no_entry() -> None:
     assert reviews == {}
 
 
-def test_reviews_snippets_capped_at_two() -> None:
-    """후보당 스니펫은 최대 2건만 원문 그대로 담는다."""
+def test_reviews_snippets_capped_at_display() -> None:
+    """후보당 스니펫은 REVIEWS_DISPLAY 건까지 원문 그대로 담는다.
+
+    요약 노드가 여러 글을 교차 대조해야 하므로 state 에는 조회한 전량을
+    남긴다. 프롬프트에 실리는 개수를 줄이는 책임은 프롬프트 뷰에 있다
+    (test_prompt_view_uses_only_first_two_snippets).
+    """
     cands = [_candidate(0)]
     hub = _ReviewHub(per_query={
         "장소0": [{"description": f"리뷰{n}"} for n in range(5)],
@@ -148,7 +153,28 @@ def test_reviews_snippets_capped_at_two() -> None:
         reviews = asyncio.run(_fetch_reviews_for(cands, _SETTINGS))
     finally:
         deps.reset_all()
-    assert reviews["c0"] == ["리뷰0", "리뷰1"]
+    assert reviews["c0"] == ["리뷰0", "리뷰1", "리뷰2"]
+
+
+def test_reviews_fetch_respects_job_budget() -> None:
+    """state 를 넘기면 잡 예산(REVIEWS_FETCH_CAP_PER_JOB)까지만 조회한다."""
+    cands = [_candidate(i) for i in range(3)]
+    hub = _ReviewHub(per_query={
+        f"장소{i}": [{"description": f"리뷰{i}"}] for i in range(3)
+    })
+    settings = SimpleNamespace(
+        REVIEWS_MAX_PLACES=3, REVIEWS_DISPLAY=3, REVIEWS_FETCH_CAP_PER_JOB=2
+    )
+    state = {"job_id": "j", "reviews_fetch_used": 1}
+    deps.set_hub_client(hub)
+    try:
+        reviews = asyncio.run(_fetch_reviews_for(cands, settings, state))
+    finally:
+        deps.reset_all()
+    # 예산 2 중 1 이 이미 소비돼 남은 1회만 호출한다.
+    assert hub.queries == ["장소0"]
+    assert reviews == {"c0": ["리뷰0"]}
+    assert state["reviews_fetch_used"] == 2
 
 
 def test_reviews_missing_hub_returns_empty() -> None:
@@ -156,6 +182,30 @@ def test_reviews_missing_hub_returns_empty() -> None:
     deps.reset_all()
     reviews = asyncio.run(_fetch_reviews_for([_candidate(0)], _SETTINGS))
     assert reviews == {}
+
+
+def test_review_query_is_prefixed_with_region() -> None:
+    """검색어에 지역을 붙여 같은 이름의 다른 지역 가게를 걸러 낸다."""
+    from datetime import date, time
+
+    from app.nodes.agent_nodes import _review_query
+    from app.schemas.agent_schemas import AgentRequest, DateRange
+
+    state = {
+        "request": AgentRequest(
+            date=DateRange(
+                date_start=date(2026, 7, 6),
+                date_end=date(2026, 7, 6),
+                time_start=time(9, 0),
+                time_end=time(18, 0),
+            ),
+            province="서울특별시",
+            city="강남구",
+        )
+    }
+    assert _review_query(state, "이스트커피") == "강남구 이스트커피"
+    # hub 가 받는 길이 상한을 넘기면 조회 자체가 실패하므로 잘라 낸다.
+    assert len(_review_query(state, "가" * 80)) == 60
 
 
 def test_reviews_fetch_failure_skips_candidate() -> None:
@@ -190,7 +240,7 @@ def test_selection_prompt_escapes_review_injection() -> None:
 def test_reason_prompt_escapes_review_injection() -> None:
     """이유 프롬프트도 리뷰 스니펫을 이스케이프해 펜스를 유지한다."""
     place = Place(
-        place_id=0, name="장소0", address="주소",
+        place_id=0, day=1, name="장소0", address="주소",
         lat=37.5, lng=127.0, recommended_visit_time="오전",
         content_id="c0",
     )
@@ -206,19 +256,40 @@ def test_reason_prompt_escapes_review_injection() -> None:
     assert "무시" not in system
 
 
+def test_prompt_view_uses_only_first_two_snippets() -> None:
+    """선정/이유 프롬프트는 스니펫이 많아도 앞 2건만 싣는다(토큰 절약)."""
+    cands = [_candidate(0)]
+    reviews = {"c0": ["리뷰0", "리뷰1", "리뷰2", "리뷰3"]}
+    _, selection_user = _build_selection_prompt(
+        _request(), {}, cands, reviews=reviews
+    )
+    place = Place(
+        place_id=0, day=1, name="장소0", address="주소",
+        lat=37.5, lng=127.0, recommended_visit_time="오전",
+        content_id="c0",
+    )
+    _, reason_user = _build_reason_prompt(
+        _request(), {}, [place], reviews=reviews
+    )
+    for user in (selection_user, reason_user):
+        assert "리뷰0" in user and "리뷰1" in user
+        assert "리뷰2" not in user and "리뷰3" not in user
+
+
 # ── recommend_places 통합(리뷰 상태 저장 + 예산 불변) ───────────
 
 def test_recommend_places_populates_reviews_state() -> None:
     """grounded 선정 경로가 state["reviews"] 를 채운다(원문 보존)."""
     cands = [_candidate(0), _candidate(1)]
+    # 노드 경유 호출은 검색어에 요청 지역이 붙는다.
     hub = _ReviewHub(per_query={
-        "장소0": [{"description": "리뷰0"}],
-        "장소1": [{"description": "리뷰1"}],
+        "강남구 장소0": [{"description": "리뷰0"}],
+        "강남구 장소1": [{"description": "리뷰1"}],
     })
     deps.set_hub_client(hub)
     deps.set_gemini_client(_SelectGemini(PlacesSelection(selections=[
-        PlaceSelection(index=0, recommended_visit_time="오전"),
-        PlaceSelection(index=1, recommended_visit_time="오후"),
+        PlaceSelection(index=0, day=1, recommended_visit_time="오전"),
+        PlaceSelection(index=1, day=1, recommended_visit_time="오후"),
     ])))
     state = {"job_id": "j", "request": _request(),
              "candidates": cands, "grounded": True}
@@ -237,7 +308,7 @@ def test_recommend_places_no_reviews_on_fetch_failure() -> None:
     cands = [_candidate(0), _candidate(1)]
     deps.set_hub_client(_ReviewHub(exc=httpx.ConnectError("down")))
     deps.set_gemini_client(_SelectGemini(PlacesSelection(selections=[
-        PlaceSelection(index=0, recommended_visit_time="오전"),
+        PlaceSelection(index=0, day=1, recommended_visit_time="오전"),
     ])))
     state = {"job_id": "j", "request": _request(),
              "candidates": cands, "grounded": True}

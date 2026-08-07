@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from app import agent_dependencies as deps
+from app.agent_settings import get_settings
 from app.nodes.agent_nodes import (
     _place_from_candidate,
     recommend_places,
@@ -77,6 +78,20 @@ class _FakeHub:
         return self._resp
 
 
+    async def estimate_dwell(self, places):
+        # 체류시간은 hub 룰이 정한다. 여기서는 요청한 장소마다 같은 값을
+        # 돌려주어 시각 계산이 결정적으로 돌아가게만 한다.
+        return {
+            "estimates": [
+                {
+                    "content_id": p["content_id"],
+                    "stay_minutes": 30,
+                    "source": "category",
+                }
+                for p in places
+            ]
+        }
+
 class _FakeGemini:
     """generate_structured 가 미리 정한 결과를 돌려주는 대역."""
 
@@ -91,7 +106,7 @@ class _FakeGemini:
 
 def test_place_from_candidate_grounded():
     """후보 dict 가 grounded Place 로 변환된다."""
-    p = _place_from_candidate(0, _candidate(1), "오전")
+    p = _place_from_candidate(0, _candidate(1), "오전", 1)
     assert p.grounded is True
     assert p.source == "durunubi"
     assert p.lat == pytest.approx(37.59)
@@ -115,7 +130,7 @@ def test_place_from_candidate_normalizes_kakao_category():
         "category": "음식점 > 카페",
         "category_group_code": "CE7",
     }
-    p = _place_from_candidate(0, kakao, "오전 10시")
+    p = _place_from_candidate(0, kakao, "오전 10시", 1)
     assert p.category == "음식점 / 카페"
     assert p.name == "우스블랑 청담점"
     assert p.grounded is True
@@ -123,7 +138,7 @@ def test_place_from_candidate_normalizes_kakao_category():
 
 def test_place_from_candidate_normalizes_visit_time():
     """방문시간(LLM 출력)에 꺾쇠가 있어도 정규화되어 통과한다."""
-    p = _place_from_candidate(0, _candidate(1), "9시 > 11시")
+    p = _place_from_candidate(0, _candidate(1), "9시 > 11시", 1)
     assert p.recommended_visit_time == "9시 / 11시"
 
 
@@ -162,10 +177,10 @@ def test_recommend_places_grounded_selection():
     candidates = [_candidate(i) for i in range(3)]
     selection = PlacesSelection(
         selections=[
-            PlaceSelection(index=2, recommended_visit_time="오전"),
-            PlaceSelection(index=0, recommended_visit_time="오후"),
-            PlaceSelection(index=99, recommended_visit_time="범위밖"),
-            PlaceSelection(index=2, recommended_visit_time="중복"),
+            PlaceSelection(index=2, day=1, recommended_visit_time="오전"),
+            PlaceSelection(index=0, day=1, recommended_visit_time="오후"),
+            PlaceSelection(index=99, day=1, recommended_visit_time="범위밖"),
+            PlaceSelection(index=2, day=1, recommended_visit_time="중복"),
         ]
     )
     deps.set_gemini_client(_FakeGemini(selection))
@@ -192,6 +207,7 @@ def test_recommend_places_fallback_invent():
         places=[
             Place(
                 place_id=5,
+                day=1,
                 name="가짜",
                 address="addr",
                 lat=37.5,
@@ -243,9 +259,9 @@ def test_select_places_skips_bad_coord_candidate():
                   _candidate(2)]
     selection = PlacesSelection(
         selections=[
-            PlaceSelection(index=0, recommended_visit_time="t0"),
-            PlaceSelection(index=1, recommended_visit_time="t1"),
-            PlaceSelection(index=2, recommended_visit_time="t2"),
+            PlaceSelection(index=0, day=1, recommended_visit_time="t0"),
+            PlaceSelection(index=1, day=1, recommended_visit_time="t1"),
+            PlaceSelection(index=2, day=1, recommended_visit_time="t2"),
         ]
     )
     deps.set_gemini_client(_FakeGemini(selection))
@@ -263,3 +279,161 @@ def test_select_places_skips_bad_coord_candidate():
     assert [p.place_id for p in places] == [0, 1]
     assert places[0].name == "코스0"
     assert places[1].name == "코스2"
+
+
+class _SeqGemini:
+    """호출 순서대로 다른 결과를 돌려주는 대역(선택 → 생성 폴백 검증용)."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = 0
+
+    async def generate_structured(
+        self, prompt, schema, *, system_instruction=None
+    ):
+        self.calls += 1
+        return self._results.pop(0)
+
+
+def test_select_empty_falls_back_to_invent_instead_of_failing():
+    """선택 결과가 비면 잡을 실패시키지 않고 생성 경로로 폴백한다.
+
+    후보가 극히 적거나 LLM 이 유효 index 를 못 고르면 선택 결과가 빈다.
+    예전에는 곧바로 error 를 세워 BFF 502 로 이어졌다. 이제는 남은 예산이
+    있으면 _invent_places 로 한 번 더 시도해야 한다.
+    """
+    # 1차: 범위 밖 index 만 반환 → 선택 0건. 2차: 생성 경로가 장소 1건 반환.
+    bad_selection = PlacesSelection(
+        selections=[
+            PlaceSelection(index=99, day=1, recommended_visit_time="오전")
+        ]
+    )
+    invented = PlacesEnvelope(
+        places=[
+            Place(
+                place_id=0,
+                day=1,
+                name="생성장소",
+                address="addr",
+                lat=37.5,
+                lng=127.0,
+                recommended_visit_time="오전",
+            )
+        ]
+    )
+    gemini = _SeqGemini([bad_selection, invented])
+    deps.set_gemini_client(gemini)
+    try:
+        state = {
+            "job_id": "j",
+            "request": _request(),
+            "candidates": [_candidate(0)],
+            "grounded": True,
+        }
+        out = asyncio.run(recommend_places(state))
+    finally:
+        deps.reset_all()
+
+    assert out.get("error") is None, "폴백이 동작하면 잡이 실패하면 안 된다"
+    assert len(out["places"]) == 1
+    assert out["places"][0].grounded is False
+    assert out.get("degraded_reason") == "select_empty_fallback_to_invent"
+    assert gemini.calls == 2
+
+
+def test_select_empty_without_budget_still_fails():
+    """예산이 남지 않으면 폴백하지 않고 기존대로 실패한다(예산 초과 방지)."""
+    bad_selection = PlacesSelection(
+        selections=[
+            PlaceSelection(index=99, day=1, recommended_visit_time="오전")
+        ]
+    )
+    gemini = _SeqGemini([bad_selection])
+    deps.set_gemini_client(gemini)
+    try:
+        state = {
+            "job_id": "j",
+            "request": _request(),
+            "candidates": [_candidate(0)],
+            "grounded": True,
+            # 선택 호출이 마지막 예산을 소비하도록 상한-1 을 미리 채운다
+            # (상한이 바뀌어도 "선택 후 잔여 0" 조건이 유지된다).
+            "llm_calls_used": (
+                get_settings().GEMINI_MAX_CALLS_PER_REQUEST - 1
+            ),
+        }
+        out = asyncio.run(recommend_places(state))
+    finally:
+        deps.reset_all()
+
+    assert out["error"] == "recommend_places returned empty"
+    assert gemini.calls == 1
+
+
+class _RecordingHub:
+    """테마별 조회를 기록하는 대역(팬아웃 검증용). 검색어마다 다른 후보 반환."""
+
+    def __init__(self, per_keyword: dict):
+        self._per_keyword = per_keyword
+        self.keywords: list = []
+
+    async def search_places(
+        self, province, city, *, mobility=None, keyword=None, size=15
+    ):
+        self.keywords.append(keyword)
+        return {"places": self._per_keyword.get(keyword, [])}
+
+
+def test_search_places_fans_out_per_theme_and_dedupes():
+    """테마마다 따로 조회하고 content_id 로 합친다(모든 테마 반영).
+
+    예전에는 테마를 공백으로 이어붙여 검색어 하나로 보냈고, Kakao 가 그
+    문자열을 통째로 매칭해 조합에 따라 0건이 나왔다.
+    """
+    shared = _candidate(0)          # 두 테마 결과에 공통으로 등장 → 1건으로 합침
+    only_cafe = _candidate(1)
+    hub = _RecordingHub({
+        "맛집": [shared],
+        "카페": [shared, only_cafe],
+    })
+    deps.set_hub_client(hub)
+    try:
+        req = _request().model_copy(update={"theme": ["food", "cafe"]})
+        state = {"job_id": "j", "request": req}
+        out = asyncio.run(search_places(state))
+    finally:
+        deps.reset_all()
+
+    # 테마 코드가 한국어 검색어로 매핑되어 각각 조회됐다.
+    assert hub.keywords == ["맛집", "카페"]
+    # content_id 중복은 제거된다.
+    ids = [c["content_id"] for c in out["candidates"]]
+    assert ids == [shared["content_id"], only_cafe["content_id"]]
+    assert out["grounded"] is True
+
+
+def test_search_places_without_theme_queries_region_once():
+    """테마가 없으면 검색어 없이 1회만 조회한다(hub 가 행정구역명으로 검색)."""
+    hub = _RecordingHub({None: [_candidate(0)]})
+    deps.set_hub_client(hub)
+    try:
+        req = _request().model_copy(update={"theme": None})
+        state = {"job_id": "j", "request": req}
+        out = asyncio.run(search_places(state))
+    finally:
+        deps.reset_all()
+
+    assert hub.keywords == [None]
+    assert len(out["candidates"]) == 1
+
+
+def test_theme_keywords_maps_known_and_keeps_unknown():
+    """알려진 테마는 한국어로 매핑하고, 모르는 값은 원문을 그대로 쓴다."""
+    from app.nodes.agent_nodes import _theme_keywords
+
+    assert _theme_keywords(["food", "night"]) == ["맛집", "야경"]
+    assert _theme_keywords(["산책"]) == ["산책"]
+    assert _theme_keywords([]) == [None]
+    assert _theme_keywords(None) == [None]
+    # 같은 검색어로 수렴하는 중복은 한 번만 조회한다.
+    assert _theme_keywords(["food", "food"]) == ["맛집"]
