@@ -1072,6 +1072,10 @@ async def recommend_places(state: AgentState) -> AgentState:
     어느 경로든 결과를 place_id 0..N-1 로 매겨 `state["places"]` 에 저장하며,
     이는 `Leg.from_place_id`/`Leg.to_place_id` 검증과의 일관성을 위함이다.
 
+    후보 절단:
+      선정 프롬프트에 싣기 직전에 후보 수를 상한까지 줄인다. 앞 노드들이
+      실패로 통과했을 때도 반드시 걸리도록 이 한 곳에서만 자른다.
+
     호출처: LangGraph(score_and_rank 다음).
     """
     await _emit_stage(state, "recommend_places")
@@ -1079,8 +1083,53 @@ async def recommend_places(state: AgentState) -> AgentState:
         return state
     candidates = state.get("candidates") or []
     if candidates:
+        candidates = _cap_candidates(candidates, _candidate_limit(state))
+        state["candidates"] = candidates
         return await _select_places(state, candidates)
     return await _invent_places(state)
+
+
+def _candidate_limit(state: AgentState) -> int:
+    """이번 요청에서 프롬프트에 실을 후보 수 상한.
+
+    하루치 일정이 고를 수 있는 폭을 여러 배 남기면서도, 일정이 길어질수록
+    함께 늘어나게 잡는다. 하한을 따로 두는 이유는 하루짜리 요청에서 상한이
+    선택 개수와 붙어 버려 사실상 고를 여지가 없어지는 것을 막기 위해서다.
+    """
+    settings = get_settings()
+    per_trip = _num_days(state["request"]) * settings.CANDIDATES_PER_DAY
+    return max(settings.CANDIDATES_MAX_BASE, per_trip)
+
+
+def _cap_candidates(candidates: list[dict], limit: int) -> list[dict]:
+    """후보를 상한까지 줄이되 실내/실외 비율이 무너지지 않게 한다.
+
+    앞 노드가 점수 내림차순으로 정렬해 두므로 단순히 앞에서 자르면 "점수가
+    낮은 것부터 버린다" 는 뜻이 되어 그 자체로는 맞다. 그런데 채점이
+    실패해 정렬 없이 통과한 경우에는 원본 순서 그대로라, 앞에서 자르면
+    실내 후보가 통째로 잘려 나갈 수 있다. 비 오는 날 실내로 몰아 주려던
+    의도가 조용히 사라지는 것이라, 양쪽에서 절반씩 뽑아 둔다.
+
+    뽑은 뒤에는 원래 순서로 되돌린다. 순서가 곧 순위이고, 프롬프트는 그
+    순위를 그대로 봐야 한다.
+    """
+    if limit <= 0 or len(candidates) <= limit:
+        return candidates
+    indoor: list[int] = []
+    outdoor: list[int] = []
+    for i, c in enumerate(candidates):
+        code = c.get("category_group_code") if isinstance(c, dict) else None
+        target = indoor if code in _INDOOR_CATEGORY_GROUPS else outdoor
+        target.append(i)
+    half = limit // 2
+    take_in = indoor[:half]
+    take_out = outdoor[: limit - len(take_in)]
+    # 한쪽이 모자라면 남은 자리를 다른 쪽으로 채운다.
+    short = limit - len(take_in) - len(take_out)
+    if short > 0:
+        take_in += indoor[len(take_in):len(take_in) + short]
+    keep = sorted(take_in + take_out)
+    return [candidates[i] for i in keep]
 
 
 def _place_from_candidate(

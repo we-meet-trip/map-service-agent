@@ -124,6 +124,16 @@ class AgentSettings(BaseSettings):
                      둔다. 추천 파이프라인의 예산과 분리돼 있어 요약이
                      추천 잡의 호출 여유를 잠식하지 않는다.
 
+    후보 절단 관련:
+      CANDIDATES_MAX_BASE / CANDIDATES_PER_DAY: 선정 프롬프트에 실을 후보
+                     수 상한을 max(BASE, 여행일수 × PER_DAY) 로 정한다.
+                     테마별로 hub 를 따로 부르고 합치는 구조라 테마 수에
+                     비례해 후보가 늘고 프롬프트 입력도 같이 커지는데,
+                     실제로 고르는 것은 일수 × 2~4 곳뿐이다. 절단은
+                     recommend_places 한 곳에서만 하며 실내/실외를 절반씩
+                     남겨, 채점이 실패해 정렬 없이 온 경우에도 실내 후보가
+                     통째로 잘리지 않게 한다.
+
     룰 엔진(hub `/v1/rules/*`) 관련:
       RULES_ENABLED: True(기본)면 rules_filter/score_and_rank 가 hub 룰
                      엔드포인트를 호출해 반경 필터·실내 보너스 랭킹을
@@ -222,6 +232,18 @@ class AgentSettings(BaseSettings):
     SUMMARY_MAX_PLACES: int = 7
     # 본 호출 1 + 형식 이탈 시 교정 재시도 1.
     SUMMARY_MAX_LLM_CALLS: int = 2
+
+    # 선정 프롬프트에 실을 후보 수 상한. 테마마다 hub 를 따로 부르고 합치기
+    # 때문에 테마를 많이 고르면 후보가 선형으로 늘고, 그 전량이 프롬프트에
+    # 실려 입력이 커진다. 실제로 고르는 것은 일수 × 2~4 곳뿐이라 나머지는
+    # 읽히고 버려진다. 상한 = max(BASE, 여행일수 × PER_DAY).
+    CANDIDATES_MAX_BASE: int = 40
+    CANDIDATES_PER_DAY: int = 12
+
+    # 테마 친화 가점 스위치. False 면 score_and_rank 가 가점 0 으로 계산해
+    # 페이로드가 도입 전과 같아진다. 가점 자체가 score_and_rank 안에 있어
+    # RULES_ENABLED=false 일 때도 함께 꺼진다.
+    PERSONALIZATION_ENABLED: bool = True
 
     RULES_ENABLED: bool = True  # kill-switch — 장애 시 no-op 복귀
 
