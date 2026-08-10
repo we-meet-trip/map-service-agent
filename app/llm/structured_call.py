@@ -102,6 +102,13 @@ async def call_structured(
             "structured output invalid (%s), corrective retry considered",
             type(e.cause).__name__,
         )
+        # 출력이 잘려서 실패한 것이라면 재시도하지 않는다. 같은 프롬프트는
+        # 같은 길이의 답을 만들어 또 잘리므로, 재시도가 예산 1 과 프롬프트
+        # 전체를 확정적으로 버리는 셈이다. 이 경우 길이를 줄이는 것이
+        # 해법이지 다시 묻는 것이 해법이 아니다.
+        if e.truncated:
+            logger.warning("output truncated — skipping corrective retry")
+            raise
         # 잔여 예산이 없으면 교정 재시도 없이 **원 예외**를 전파한다
         # (LLMBudgetExceeded 로 바꿔치지 않는다 — 실패 원인 보존).
         if state.get("llm_calls_used", 0) >= max_calls:

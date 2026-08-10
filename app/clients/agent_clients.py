@@ -39,12 +39,43 @@ class StructuredOutputError(ValueError):
 
     raw_text: 모델이 돌려준 검증 실패 원문(빈 문자열일 수 있음).
     cause: 원인 예외(pydantic ValidationError 등).
+    truncated: 출력 토큰 상한에 걸려 응답이 잘렸는지. 잘린 경우 같은
+        프롬프트로 다시 물어도 같은 길이에서 또 잘리므로, 교정 재시도가
+        예산과 입력 토큰만 확정적으로 낭비한다. 호출측이 이 값을 보고
+        재시도를 건너뛴다.
     """
 
-    def __init__(self, message: str, *, raw_text: str, cause: Exception) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_text: str,
+        cause: Exception,
+        truncated: bool = False,
+    ) -> None:
         super().__init__(message)
         self.raw_text = raw_text
         self.cause = cause
+        self.truncated = truncated
+
+
+def _is_truncated(resp) -> bool:
+    """응답이 출력 토큰 상한에 걸려 잘렸는지 판정한다.
+
+    종료 사유는 SDK 버전에 따라 enum 이기도 하고 문자열이기도 해서,
+    타입을 가정하지 않고 이름만 뽑아 대조한다. 응답 구조가 예상과 달라
+    꺼내지 못하면 잘리지 않은 것으로 본다 — 확실하지 않을 때는 기존
+    동작(교정 재시도)을 유지하는 쪽이 안전하다.
+    """
+    try:
+        candidates = resp.candidates or []
+        reason = candidates[0].finish_reason if candidates else None
+    except Exception:  # noqa: BLE001 — 판정 실패가 호출을 죽이면 안 된다
+        return False
+    if reason is None:
+        return False
+    name = getattr(reason, "name", None) or str(reason)
+    return "MAX_TOKENS" in name
 
 
 class HubClient:
@@ -555,6 +586,7 @@ class GeminiClient:
                 f"structured output validation failed: {type(e).__name__}",
                 raw_text=body,
                 cause=e,
+                truncated=_is_truncated(resp),
             ) from e
 
     async def aclose(self) -> None:

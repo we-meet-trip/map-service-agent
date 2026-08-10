@@ -21,28 +21,40 @@ class _Echo(BaseModel):
     value: int
 
 
+class _FakeCandidate:
+    def __init__(self, finish_reason) -> None:
+        self.finish_reason = finish_reason
+
+
 class _FakeResponse:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, finish_reason=None) -> None:
         self.text = text
+        # 종료 사유를 준 경우에만 candidates 를 만든다. 주지 않으면
+        # 속성 자체가 없어, 응답 구조를 못 읽는 상황도 함께 재현된다.
+        if finish_reason is not None:
+            self.candidates = [_FakeCandidate(finish_reason)]
 
 
 class _FakeAioModels:
     """generate_content 호출 인자를 기록하고 준비된 응답을 돌려주는 대역."""
 
-    def __init__(self, response_text: str) -> None:
+    def __init__(self, response_text: str, finish_reason=None) -> None:
         self.response_text = response_text
+        self.finish_reason = finish_reason
         self.calls: list[dict] = []
 
     async def generate_content(self, *, model, contents, config):
         self.calls.append(
             {"model": model, "contents": contents, "config": config}
         )
-        return _FakeResponse(self.response_text)
+        return _FakeResponse(self.response_text, self.finish_reason)
 
 
-def _install_fake_genai(monkeypatch, response_text: str) -> _FakeAioModels:
+def _install_fake_genai(
+    monkeypatch, response_text: str, finish_reason=None
+) -> _FakeAioModels:
     """sys.modules 에 가짜 google/google.genai 모듈 트리를 주입한다."""
-    fake_models = _FakeAioModels(response_text)
+    fake_models = _FakeAioModels(response_text, finish_reason)
 
     class _FakeClient:
         # 신규 GeminiClient 는 재시도 설정 시 http_options 를 넘긴다.
@@ -210,3 +222,52 @@ def test_validation_failure_raises_structured_error(monkeypatch) -> None:
     assert err.raw_text == '{"wrong": true}'
     assert isinstance(err, ValueError)  # 기존 except ValueError 분기 호환
     assert err.cause is not None
+
+
+def test_truncated_response_is_flagged(monkeypatch) -> None:
+    """출력 상한에 걸려 잘린 응답은 그 사실을 실어 보낸다.
+
+    잘린 것과 형식을 틀린 것은 대응이 다르다. 잘린 쪽은 다시 물어도
+    같은 자리에서 또 잘리므로 호출측이 재시도를 건너뛴다.
+    """
+    _install_fake_genai(monkeypatch, '{"value": 1', finish_reason="MAX_TOKENS")
+    from app.clients.agent_clients import GeminiClient, StructuredOutputError
+
+    client = GeminiClient(api_key="k", model="m", timeout=5.0)
+    with pytest.raises(StructuredOutputError) as exc_info:
+        asyncio.run(client.generate_structured("p", _Echo))
+    assert exc_info.value.truncated is True
+
+
+def test_non_truncated_response_is_not_flagged(monkeypatch) -> None:
+    """정상 종료인데 형식이 틀린 경우는 잘린 것으로 보지 않는다."""
+    _install_fake_genai(monkeypatch, '{"wrong": true}', finish_reason="STOP")
+    from app.clients.agent_clients import GeminiClient, StructuredOutputError
+
+    client = GeminiClient(api_key="k", model="m", timeout=5.0)
+    with pytest.raises(StructuredOutputError) as exc_info:
+        asyncio.run(client.generate_structured("p", _Echo))
+    assert exc_info.value.truncated is False
+
+
+def test_truncation_check_tolerates_unknown_shapes() -> None:
+    """응답 구조를 못 읽어도 판정이 예외를 던지지 않는다."""
+    from app.clients.agent_clients import _is_truncated
+
+    class _EnumLike:
+        name = "MAX_TOKENS"
+
+    class _Cand:
+        def __init__(self, r) -> None:
+            self.finish_reason = r
+
+    class _Resp:
+        def __init__(self, cands) -> None:
+            self.candidates = cands
+
+    assert _is_truncated(_Resp([_Cand(_EnumLike())])) is True
+    assert _is_truncated(_Resp([_Cand("FinishReason.MAX_TOKENS")])) is True
+    assert _is_truncated(_Resp([_Cand("STOP")])) is False
+    assert _is_truncated(_Resp([_Cand(None)])) is False
+    assert _is_truncated(_Resp([])) is False
+    assert _is_truncated(object()) is False
