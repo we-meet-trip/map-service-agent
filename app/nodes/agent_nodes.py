@@ -250,6 +250,66 @@ def _theme_keywords(themes: list[str] | None) -> list[str | None]:
     return seen or [None]
 
 
+# ─── 테마 친화도 ─────────────────────────────────────────────────
+# 테마를 검색어로만 쓰면 "카페를 좋아한다" 가 후보 풀에 카페를 넣는 데까지만
+# 작용하고, 그 안에서 어느 것을 위로 올릴지는 손대지 못한다. 여기서 후보의
+# 분류를 보고 약한 가점을 준다.
+#
+# 값을 작게 잡는 것이 중요하다. hub 실내 가점이 0.15 인데 취향 가점을 그보다
+# 크게 주면 비 오는 날 실외로 몰게 된다. 날씨·이동수단 같은 물리적 제약이
+# 취향을 항상 이겨야 한다.
+#
+# 판정은 (카테고리 그룹 코드, 분류 텍스트 조각) 두 갈래로 한다. 그룹 코드는
+# 카카오 장소에만 있고 두루누비 코스에는 없어서, 코스는 텍스트로만 걸린다.
+_THEME_AFFINITY: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "food": (("FD6",), ("음식점", "한식", "일식", "중식", "양식")),
+    "cafe": (("CE7",), ("카페", "디저트", "베이커리", "제과")),
+    "photo": (("AT4",), ("명소", "전망", "테마파크")),
+    "nature": (
+        ("AT4",),
+        ("공원", "해수욕장", "계곡", "수목원", "등산", "산책로", "걷기길"),
+    ),
+    "history": (
+        ("CT1",),
+        ("문화유적", "고궁", "궁궐", "박물관", "미술관", "사찰", "유적"),
+    ),
+    "activity": (("AT4",), ("레저", "체험", "스포츠", "자전거길")),
+    "shopping": (("MT1",), ("쇼핑", "시장", "백화점", "마트", "아울렛")),
+    "night": (("AT4",), ("야경", "전망")),
+}
+
+# 가점 상한. hub 실내 가점(0.15)보다 작게 둔다.
+_AFFINITY_MAX = 0.10
+# 뒤쪽 테마일수록 곱해서 줄인다. 목록 앞이 곧 우선순위라는 규약을 점수로
+# 옮긴 것이다 — 호출 측이 사용자가 직접 고른 테마를 앞에 둔다.
+_AFFINITY_DECAY = 0.7
+
+
+def _affinity(candidate: dict, themes: list[str] | None) -> float:
+    """후보 한 건의 테마 친화 가점(0 ~ _AFFINITY_MAX).
+
+    여러 테마에 걸리면 합하지 않고 가장 큰 것만 쓴다. 합하면 테마를 많이
+    고른 사용자에게만 점수가 몰려 상한이 무너지고, 무엇보다 "여러 테마에
+    두루 걸치는 무난한 장소" 가 "한 테마에 정확히 맞는 장소" 를 이겨 버린다.
+    """
+    if not themes:
+        return 0.0
+    code = candidate.get("category_group_code")
+    text = candidate.get("category") or ""
+    best = 0.0
+    for i, raw in enumerate(themes[:_THEME_QUERY_MAX]):
+        if not isinstance(raw, str):
+            continue
+        spec = _THEME_AFFINITY.get(raw.strip().lower())
+        if not spec:
+            continue
+        codes, needles = spec
+        if code not in codes and not any(n in text for n in needles):
+            continue
+        best = max(best, _AFFINITY_MAX * (_AFFINITY_DECAY ** i))
+    return best
+
+
 def _merge_place_results(results) -> list[dict]:
     """테마별 조회 결과를 content_id 기준으로 합친다(순서 보존).
 
@@ -1110,13 +1170,20 @@ async def score_and_rank(state: AgentState) -> AgentState:
         day_pop_max = max((p for p in pops if p is not None), default=0)
     # 채점 대상 pois: content_id 가 있는 후보만. indoor_flag 는 Kakao
     # category_group_code 가 실내 성향 그룹에 속하는지로 판정, base_score 는
-    # 현재 랭크 순서를 반영한 rank-decay(1.0 - 0.01*i).
+    # 현재 랭크 순서를 반영한 rank-decay(1.0 - 0.01*i) 에 테마 친화 가점을
+    # 더한 값이다. hub 는 base_score 를 그대로 받아 실내 보너스만 얹으므로,
+    # 취향을 여기서 섞어도 룰 엔진의 책임은 그대로다.
+    themes = (
+        state["request"].theme
+        if settings.PERSONALIZATION_ENABLED
+        else None
+    )
     pois = [
         {
             "content_id": c["content_id"],
             "indoor_flag": c.get("category_group_code")
             in _INDOOR_CATEGORY_GROUPS,
-            "base_score": 1.0 - 0.01 * i,
+            "base_score": 1.0 - 0.01 * i + _affinity(c, themes),
         }
         for i, c in enumerate(candidates)
         if isinstance(c, dict) and c.get("content_id")
