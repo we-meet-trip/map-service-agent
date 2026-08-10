@@ -41,11 +41,11 @@ from app.security.sanitize import (
 from app.llm.structured_call import LLMBudgetExceeded
 from app.schemas.agent_schemas import (
     AgentRequest,
+    InventedPlaces,
     JobDonePayload,
     Leg,
     Mobility,
     Place,
-    PlacesEnvelope,
     PlacesSelection,
     ReasonEnvelope,
 )
@@ -1452,8 +1452,8 @@ async def _select_places(
 async def _invent_places(state: AgentState) -> AgentState:
     """폴백 경로 — 실측 후보가 없을 때 LLM 이 장소를 생성한다.
 
-    기존 생성 프롬프트로 `PlacesEnvelope` 를 받고, place_id 0..N-1 로
-    정규화하며 각 장소를 grounded=False(저신뢰) 로 표시한다.
+    생성 프롬프트로 `InventedPlaces` 를 받고, place_id 0..N-1 로 정규화하며
+    각 장소를 grounded=False(저신뢰) 로 표시한다.
     호출은 `call_structured`(예산 + 교정 재시도)를 거친다.
     """
     req = state["request"]
@@ -1463,7 +1463,7 @@ async def _invent_places(state: AgentState) -> AgentState:
         envelope = await call_structured(
             state,
             prompt,
-            PlacesEnvelope,
+            InventedPlaces,
             system_instruction=system,
             max_calls=get_settings().GEMINI_MAX_CALLS_PER_REQUEST,
         )
@@ -1486,20 +1486,22 @@ async def _invent_places(state: AgentState) -> AgentState:
     if any(p.day > num_days for p in envelope.places):
         state["error"] = f"place day out of range (1..{num_days})"
         return state
-    # place_id 정규화(0..N-1) + 실측 근거 없음 표시. 일차 순서대로 매겨
-    # 동선 프롬프트의 정렬 제약과 어긋나지 않게 한다.
-    # bullets/reason 은 여기서 반드시 지운다. Place 는 두 필드를 선택값으로
-    # 갖고 있고 이 응답 스키마가 그대로 LLM 에 노출되므로, 모델이 채워 보내면
-    # 검증을 통과해 그대로 하류로 흘러간다. bullets 는 "블로그 후기를 종합한
-    # 요약"이라는 계약이라 후기를 한 건도 읽지 않은 이 경로의 값은 근거가
-    # 없다. 뒤의 요약·이유 노드가 정당한 값을 채운다.
+    # 응답을 Place 로 옮기며 place_id 를 0..N-1 로 매기고 실측 근거 없음을
+    # 표시한다. 일차 순서대로 매겨 동선 단계의 정렬 제약과 어긋나지 않게
+    # 한다. 나머지 필드는 채우지 않는다 — 실측 출처에서만 나오는 값이거나,
+    # 뒤의 시간축·이유 단계가 채울 값이다. 응답 스키마에 그 자리가 아예
+    # 없으므로 모델이 근거 없는 값을 흘려 넣을 경로도 없다.
     normalized = [
-        p.model_copy(update={
-            "place_id": i,
-            "grounded": False,
-            "bullets": None,
-            "reason": None,
-        })
+        Place(
+            place_id=i,
+            day=p.day,
+            name=p.name,
+            address=p.address,
+            lat=p.lat,
+            lng=p.lng,
+            recommended_visit_time=p.recommended_visit_time,
+            grounded=False,
+        )
         for i, p in enumerate(
             sorted(envelope.places, key=lambda p: p.day)
         )

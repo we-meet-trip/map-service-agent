@@ -33,10 +33,13 @@ class AgentSettings(BaseSettings):
                       집행한다.
       GEMINI_MAX_CALLS_PER_REQUEST: 추천 요청 1건당 LLM 호출 하드 예산.
                       교정 재시도 포함 모든 호출이 본 예산을 소비한다.
-                      정상 경로 소비 내역: 장소 선정 1 + 동선 1 +
-                      추천이유 1 = 3. 블로그 요약은 추천 파이프라인에서
-                      빠져 별도 파이프라인이 자기 예산
-                      (SUMMARY_MAX_LLM_CALLS)으로 돈다.
+                      정상 경로 소비 내역: 장소 선정 1 + 추천이유 1 = 2.
+                      동선은 좌표로 계산해 모델을 부르지 않는다. 남는 1은
+                      앞 단계가 형식을 한 번 어겼을 때 쓸 교정 재시도
+                      여력으로 비워 둔 것이다. 블로그 요약은 추천
+                      파이프라인에서 빠져 별도 파이프라인이 자기 예산
+                      (SUMMARY_MAX_LLM_CALLS)으로 돈다. 다만 일일 한도는
+                      두 파이프라인이 같은 카운터를 공유한다.
       GEMINI_TEMPERATURE: 생성 온도. 구조화 출력의 결정성을 위해 낮게 둔다.
       GEMINI_MAX_OUTPUT_TOKENS: 응답 토큰 상한. Gemini 2.5 계열은 thinking
                       토큰이 본 상한을 함께 소비하므로 과소 설정 시 JSON 이

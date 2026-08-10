@@ -21,10 +21,10 @@ from app.nodes.agent_nodes import (
 from app.schemas.agent_schemas import (
     AgentRequest,
     DateRange,
+    InventedPlace,
+    InventedPlaces,
     Mobility,
-    Place,
     PlaceSelection,
-    PlacesEnvelope,
     PlacesSelection,
 )
 
@@ -203,10 +203,9 @@ def test_recommend_places_grounded_selection():
 
 def test_recommend_places_fallback_invent():
     """후보가 없으면 LLM 생성 폴백 + grounded=False 표시."""
-    invented = PlacesEnvelope(
+    invented = InventedPlaces(
         places=[
-            Place(
-                place_id=5,
+            InventedPlace(
                 day=1,
                 name="가짜",
                 address="addr",
@@ -308,10 +307,9 @@ def test_select_empty_falls_back_to_invent_instead_of_failing():
             PlaceSelection(index=99, day=1, recommended_visit_time="오전")
         ]
     )
-    invented = PlacesEnvelope(
+    invented = InventedPlaces(
         places=[
-            Place(
-                place_id=0,
+            InventedPlace(
                 day=1,
                 name="생성장소",
                 address="addr",
@@ -437,3 +435,58 @@ def test_theme_keywords_maps_known_and_keeps_unknown():
     assert _theme_keywords(None) == [None]
     # 같은 검색어로 수렴하는 중복은 한 번만 조회한다.
     assert _theme_keywords(["food", "food"]) == ["맛집"]
+
+
+class _SchemaSpyGemini:
+    """어떤 응답 스키마로 호출됐는지 기록하는 대역."""
+
+    def __init__(self, result) -> None:
+        self._result = result
+        self.schemas: list[type] = []
+
+    async def generate_structured(
+        self, prompt, schema, *, system_instruction=None
+    ):
+        self.schemas.append(schema)
+        return self._result
+
+
+def test_invent_path_requests_the_slim_schema():
+    """창작 경로는 슬림 스키마로 묻는다.
+
+    응답 스키마는 프롬프트 입력으로 함께 실려 나가므로, 쓰지 않는 필드가
+    붙은 스키마를 넘기면 매 호출이 그만큼 비싸진다. 대역이 schema 인자를
+    무시하고 미리 만든 객체를 돌려주는 구조라, 어떤 스키마로 물었는지는
+    여기서 따로 확인하지 않으면 조용히 어긋난다.
+    """
+    invented = InventedPlaces(
+        places=[
+            InventedPlace(
+                day=1,
+                name="가짜",
+                address="addr",
+                lat=37.5,
+                lng=127.0,
+                recommended_visit_time="오전",
+            )
+        ]
+    )
+    spy = _SchemaSpyGemini(invented)
+    deps.set_gemini_client(spy)
+    try:
+        asyncio.run(recommend_places({"job_id": "j", "request": _request()}))
+    finally:
+        deps.reset_all()
+    assert spy.schemas == [InventedPlaces]
+
+
+def test_slim_schema_has_no_downstream_only_fields():
+    """모델이 채울 수 없는 필드는 스키마에 두지 않는다."""
+    fields = set(InventedPlace.model_fields)
+    assert fields == {
+        "day", "name", "address", "lat", "lng", "recommended_visit_time",
+    }
+    # 실측 출처·후속 단계가 채우는 값이 새어 들어오지 않았는지 본다.
+    for leaked in ("place_id", "content_id", "source", "grounded",
+                   "reason", "bullets", "stay_minutes", "visit_start"):
+        assert leaked not in fields

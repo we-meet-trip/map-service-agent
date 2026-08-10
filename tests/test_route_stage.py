@@ -19,12 +19,10 @@ from app.schemas.agent_schemas import (
     AgentRequest,
     BulletsEnvelope,
     DateRange,
-    Leg,
     Mobility,
     PlaceBullets,
     PlaceReason,
     ReasonEnvelope,
-    RouteEnvelope,
     SelectedPlace,
 )
 
@@ -122,22 +120,6 @@ class _CapturePublisher:
     async def publish(self, job_id, status, payload_json):
         self.payloads.append(json.loads(payload_json))
         return "1-0"
-
-
-def _route_envelope(n: int) -> RouteEnvelope:
-    return RouteEnvelope(
-        visit_order=list(range(n)),
-        legs=[
-            Leg.model_validate({
-                "from": i,
-                "to": i + 1,
-                "mode": "walk",
-                "estimated_distance_km": 1.0,
-                "estimated_duration_min": 15,
-            })
-            for i in range(n - 1)
-        ],
-    )
 
 
 def _reason_envelope(n: int) -> ReasonEnvelope:

@@ -492,7 +492,7 @@ class GeminiClient:
 
         prompt: 입력 프롬프트(데이터 태그로 격리된 user 콘텐츠).
         response_schema: 응답 스키마로 사용할 Pydantic 모델 클래스(예:
-                         `PlacesEnvelope`, `RouteEnvelope`).
+                         `InventedPlaces`, `ReasonEnvelope`).
         system_instruction: 불변 규칙(역할·인젝션 방어·스키마 준수)을
                             담는 시스템 지시. 사용자 유래 문자열을 절대
                             섞지 않는다(프롬프트 인젝션 방어의 1층).
