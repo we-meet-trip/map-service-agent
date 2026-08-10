@@ -16,13 +16,11 @@ from app.graph.agent_graph import build_graph
 from app.schemas.agent_schemas import (
     AgentRequest,
     DateRange,
-    Leg,
     Mobility,
     PlaceReason,
     PlaceSelection,
     PlacesSelection,
     ReasonEnvelope,
-    RouteEnvelope,
 )
 
 

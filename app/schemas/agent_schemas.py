@@ -5,7 +5,8 @@
   - 입력 모델:   `AgentRequest`, `DateRange`, `Mobility`
   - 응답 모델:   `AgentJobAccepted` (`/v1/recommend` 의 202 응답)
   - 도메인 모델: `Place`, `Leg`
-  - LLM 응답 래퍼: `PlacesEnvelope`, `RouteEnvelope`
+  - LLM 응답 래퍼: `InventedPlaces`, `PlacesSelection`,
+    `ReasonEnvelope`, `BulletsEnvelope`
   - Streams 발행 페이로드: `JobDonePayload`
 
 사용처:
@@ -20,6 +21,8 @@ from enum import Enum
 from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.security.sanitize import neutralize_tags
 
 # LLM 생성 텍스트 필드에서 거부하는 문자: 태그 문자(<, >)와 제어문자.
 # 프롬프트 인젝션 산출물이 페이로드를 타고 하류(클라이언트 렌더링,
@@ -36,6 +39,11 @@ _FORBIDDEN_TEXT_RE = re.compile(
     "\U000e0000-\U000e007f"                        # Unicode Tags 블록
     "]"
 )
+
+
+# 분류 문자열의 표시 상한. 요약 요청이 쓰는 값과 같게 맞춘다. 내보내는
+# 쪽에는 상한이 없으므로 거절이 아니라 이 길이로 자른다.
+_CATEGORY_MAX = 80
 
 
 def _reject_tags_and_control(value):
@@ -132,6 +140,10 @@ class SelectedPlace(BaseModel):
          받아야 한다.
     content_id: 실측 출처 식별자. 있으면 리뷰 조회에 그대로 쓰고, 없으면
                 이름으로 조회한다.
+    category: 장소 분류. 이 단계는 장소를 새로 찾지 않아 분류를 알 방법이
+              없으므로, 호출 측이 처음 받았던 값을 되돌려 준다. 표시용이라
+              너무 길거나 꺾쇠가 섞여 있어도 요청을 거절하지 않고 다듬는다 —
+              분류 한 줄 때문에 여행 전체가 실패하면 안 된다.
     """
     name: str = Field(min_length=1, max_length=80)
     address: str = Field(default="", max_length=200)
@@ -139,6 +151,7 @@ class SelectedPlace(BaseModel):
     lng: float = Field(ge=124.0, le=132.0)
     day: int = Field(default=1, ge=1)
     content_id: Optional[str] = Field(default=None, max_length=64)
+    category: Optional[str] = Field(default=None)
 
     @field_validator("day", mode="before")
     @classmethod
@@ -151,6 +164,20 @@ class SelectedPlace(BaseModel):
     def _blank_when_null(cls, value):
         """JSON `"address": null` 을 빈 문자열로 접는다."""
         return "" if value is None else value
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _tidy_category(cls, value):
+        """분류를 무해화하고 상한까지 자른다.
+
+        받는 값은 우리가 앞서 내보낸 표시용 문자열이다. 거절하면 사용자가
+        본 적도 없는 글자 때문에 동선 요청 전체가 막히므로, 뒤이어 Place 가
+        거부하는 문자만 바꾸고 길이를 맞춘다.
+        """
+        if not isinstance(value, str):
+            return value
+        tidy = neutralize_tags(value).strip()
+        return tidy[:_CATEGORY_MAX] or None
 
     _no_tags = field_validator("name", "address", "content_id")(
         _reject_tags_and_control
@@ -354,21 +381,55 @@ class PlacesEnvelope(BaseModel):
     places: 추천 장소 리스트.
 
     사용처:
-      - 외부 실측 후보가 없을 때(grounding 불가)의 폴백 경로에서
-        `GeminiClient.generate_structured(prompt, PlacesEnvelope)` 의
-        `response_schema` 로 전달되어 JSON → 모델 검증을 수행한다.
+      - 저장된 옛 결과를 이 형태로 되읽는 경로가 남아 있어 선언을 유지한다.
+        폴백 경로의 응답 스키마는 `InventedPlaces` 로 옮겨 갔다.
     """
     places: List[Place]
 
 
-class PlaceSelection(BaseModel):
-    """grounded 경로에서 LLM 이 고른 후보 1건.
+# InventedPlace / InventedPlaces — 창작 경로의 응답 스키마.
+#
+# Place 를 그대로 쓰지 않는 이유가 둘이다.
+#
+# 첫째, 모델이 채울 수 없는 필드가 대부분이다. content_id·source·코스
+# 관련 값은 실측 출처에서만 나오고, 체류시간과 방문 시각은 뒤의 시간축
+# 노드가 계산하며, 이유와 요약은 각자 다른 단계가 채운다.
+#
+# 둘째, 응답 스키마는 프롬프트 입력으로 함께 실려 나간다. 쓰지 않는
+# 필드를 두면 그만큼을 매 호출 입력에 얹는 셈이고, 모델이 그 필드를 채워
+# 보내면 출력도 같이 늘어난다.
+#
+# 필드를 없애 두면 "모델이 채워 보낸 값을 나중에 지운다" 는 방어도
+# 필요 없어진다. 애초에 채울 자리가 없다.
+#
+# **클래스 docstring 을 짧게 두는 것도 같은 이유다.** pydantic 은
+# docstring 을 스키마의 description 으로 싣고, 그 스키마가 매 호출
+# 입력으로 나간다. 설계 배경은 모델이 읽을 내용이 아니므로 여기 주석에
+# 둔다. 필드 의미는 이름과 제약으로 충분히 드러난다.
+class InventedPlace(BaseModel):
+    """모델이 만들어 낸 장소 한 건."""
+    day: int = Field(ge=1)
+    name: str = Field(min_length=1, max_length=80)
+    address: str = Field(max_length=200)
+    lat: float = Field(ge=33.0, le=43.0)
+    lng: float = Field(ge=124.0, le=132.0)
+    recommended_visit_time: str = Field(max_length=50)
 
-    index: 후보 목록에서 선택한 항목의 0 기반 인덱스.
-    day: 해당 장소를 방문할 여행 일차(1부터). 여행 일수를 넘는 값은
-         `_select_places` 가 그 선택만 건너뛴다.
-    recommended_visit_time: 해당 장소의 권장 방문 시간 텍스트.
-    """
+    _no_tags = field_validator(
+        "name", "address", "recommended_visit_time",
+    )(_reject_tags_and_control)
+
+
+# `_invent_places` 가 response_schema 로 넘긴다. 받은 뒤 Place 로 옮기며
+# place_id 를 매기고 grounded 를 False 로 표시한다.
+class InventedPlaces(BaseModel):
+    """추천 장소 목록."""
+    places: List[InventedPlace]
+
+
+# 여행 일수를 넘는 day 는 `_select_places` 가 그 선택만 건너뛴다.
+class PlaceSelection(BaseModel):
+    """고른 후보 1건."""
     index: int = Field(ge=0)
     day: int = Field(ge=1)
     recommended_visit_time: str = Field(max_length=50)
@@ -378,76 +439,51 @@ class PlaceSelection(BaseModel):
     )
 
 
+# `_select_places` 가 response_schema 로 넘긴다. 이름·주소·좌표는 모델이
+# 만들지 않고 후보값을 그대로 쓰므로 인덱스만 받는다.
 class PlacesSelection(BaseModel):
-    """`recommend_places` 의 grounded 경로에서 LLM 이 돌려주는 선택 결과.
-
-    selections: 실측 후보 중에서 고른 항목들(방문 시간 포함). 장소의
-        이름·주소·좌표는 LLM 이 새로 만들지 않고 후보값을 그대로 쓴다.
-
-    사용처:
-      - `GeminiClient.generate_structured(prompt, PlacesSelection)` 의
-        `response_schema`.
-    """
+    """고른 후보 목록."""
     selections: List[PlaceSelection]
 
 
+# place_id 가 유효 집합의 부분집합인지·중복이 없는지는 `llm_reason` 이
+# 응답을 받은 뒤 확인한다. 글자 상한은 장소 수에 따라 프롬프트가 따로
+# 지시하며, 여기 200 은 계약상의 천장이다.
 class PlaceReason(BaseModel):
-    """`llm_reason` 응답의 장소별 추천 이유 1건.
-
-    place_id: 대상 장소의 place_id. `llm_reason` 노드가 유효 id 집합
-              부분집합·무중복을 semantic 검증한다.
-    reason: 추천 이유 텍스트(≤200자, 태그/제어문자 금지).
-    """
+    """장소 한 곳의 추천 이유."""
     place_id: int
     reason: str = Field(min_length=1, max_length=200)
 
     _no_tags = field_validator("reason")(_reject_tags_and_control)
 
 
+# `llm_reason` 이 response_schema 로 넘긴다. 모든 place_id 에 대해 각
+# 1건이 목표이고, 모자라면 빠진 것만 다시 묻는다.
 class ReasonEnvelope(BaseModel):
-    """`llm_reason` 단계에서 LLM 이 돌려주는 구조화 응답의 루트.
-
-    reasons: 장소별 추천 이유 리스트(모든 place_id 각 1건이 목표).
-    clothing: 날씨 기반 옷차림 안내 전역 1건(≤300자).
-
-    사용처:
-      - `GeminiClient.generate_structured(prompt, ReasonEnvelope)` 의
-        `response_schema` (llm_reason 노드, LLM 3번째 호출).
-    """
+    """장소별 추천 이유와 옷차림 안내."""
     reasons: List[PlaceReason]
     clothing: str = Field(min_length=1, max_length=300)
 
     _no_tags = field_validator("clothing")(_reject_tags_and_control)
 
 
+# 하류 계약은 "정확히 2줄"이지만 스키마는 1~4줄을 받는다. 줄 수를
+# 스키마로 못 박으면 모델이 3줄을 쓴 순간 응답 전체가 검증에 걸려 모든
+# 장소의 요약이 함께 사라진다. 개수 정규화는 `collect_bullets` 가 맡아
+# (2줄 미만 폐기, 초과분 절단) 일부만 어긋나도 나머지는 살린다.
+# place_id 의 유효성·중복도 같은 곳에서 확인한다.
 class PlaceBullets(BaseModel):
-    """`summarize_reviews` 응답의 장소별 블로그 요약 1건.
-
-    place_id: 대상 장소의 place_id. `summarize_reviews` 노드가 유효 id
-              집합의 부분집합인지·무중복인지 semantic 검증한다.
-    bullets: 요약 줄. 각 줄은 1..BULLET_MAX_LEN 자, 태그/제어문자 금지.
-             하류 계약은 "정확히 2줄"이지만 스키마는 1~4줄을 받는다 —
-             줄 수를 스키마로 못 박으면 모델이 3줄을 쓴 순간 응답 전체가
-             검증에 걸려 모든 장소의 요약이 함께 사라진다. 개수 정규화는
-             노드가 맡아(2줄 미만 항목 폐기, 초과분 절단) 일부만 어긋난
-             경우에도 나머지 장소는 살린다.
-    """
+    """장소 한 곳의 후기 요약."""
     place_id: int
     bullets: List[str] = Field(min_length=1, max_length=4)
 
     _no_tags = field_validator("bullets")(_reject_tags_and_control_list)
 
 
+# `summarize` 가 response_schema 로 넘긴다. 후기를 확보한 장소만
+# 대상이라 요청한 장소가 전부 오지 않을 수 있다(부분 커버리지 허용).
 class BulletsEnvelope(BaseModel):
-    """`summarize_reviews` 단계에서 LLM 이 돌려주는 구조화 응답의 루트.
-
-    items: 장소별 요약 리스트. 리뷰 스니펫을 확보한 장소만 대상이므로
-           요청한 장소 전부가 오지 않을 수 있다(부분 커버리지 허용).
-
-    사용처:
-      - `GeminiClient.generate_structured(prompt, BulletsEnvelope)` 의
-        `response_schema` (summarize_reviews 노드, LLM 4번째 호출).
-    """
+    """장소별 후기 요약 목록."""
     items: List[PlaceBullets]
 
 
@@ -521,21 +557,6 @@ class ReviewsSummaryBatchResponse(BaseModel):
              빠진다 — 부분 커버리지는 오류가 아니라 정상 결과다.
     """
     results: List[PlaceSummaryResult] = Field(default_factory=list)
-
-
-class RouteEnvelope(BaseModel):
-    """`recommend_route` 단계에서 LLM 이 돌려주는 구조화 응답의 루트.
-
-    visit_order: 방문 순서. `places` 의 `place_id` 들로 이루어진 순열.
-                 `recommend_route` 노드가 "정확히 같은 집합" 인지 검증한다.
-    legs: 방문 순서에 따른 구간 리스트. 길이는 `len(places) - 1`.
-
-    사용처:
-      - `GeminiClient.generate_structured(prompt, RouteEnvelope)` 의
-        `response_schema`.
-    """
-    visit_order: List[int]
-    legs: List[Leg]
 
 
 class JobDonePayload(BaseModel):

@@ -118,3 +118,55 @@ def test_non_schema_error_no_retry() -> None:
         deps.reset_all()
     assert len(fake.prompts) == 1
     assert state["llm_calls_used"] == 1
+
+
+class _TruncatedGemini:
+    """출력이 잘려 실패했다고 알리는 대역."""
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def generate_structured(
+        self, prompt, schema, *, system_instruction=None
+    ):
+        self.prompts.append(prompt)
+        raise StructuredOutputError(
+            "invalid",
+            raw_text='{"value": 1',
+            cause=ValueError("EOF while parsing"),
+            truncated=True,
+        )
+
+
+def test_truncated_output_skips_corrective_retry() -> None:
+    """잘려서 실패한 응답은 다시 묻지 않는다.
+
+    같은 프롬프트는 같은 길이의 답을 만들어 또 잘린다. 재시도해 봐야
+    예산 1 과 프롬프트 전체를 확정적으로 버릴 뿐이라, 예산이 남아
+    있어도 건너뛴다.
+    """
+    gemini = _TruncatedGemini()
+    deps.set_gemini_client(gemini)
+    state: dict = {}
+    try:
+        with pytest.raises(StructuredOutputError):
+            asyncio.run(
+                call_structured(state, "p", _Echo, max_calls=3)
+            )
+    finally:
+        deps.reset_all()
+    assert len(gemini.prompts) == 1, "재시도가 나가면 안 된다"
+    assert state["llm_calls_used"] == 1
+
+
+def test_non_truncated_failure_still_retries() -> None:
+    """잘린 것이 아니면 기존대로 한 번 교정한다."""
+    gemini = _FlakyGemini(fail_times=1, result=_Echo(value=7))
+    deps.set_gemini_client(gemini)
+    state: dict = {}
+    try:
+        out = asyncio.run(call_structured(state, "p", _Echo, max_calls=3))
+    finally:
+        deps.reset_all()
+    assert out.value == 7
+    assert len(gemini.prompts) == 2

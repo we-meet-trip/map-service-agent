@@ -33,10 +33,13 @@ class AgentSettings(BaseSettings):
                       집행한다.
       GEMINI_MAX_CALLS_PER_REQUEST: 추천 요청 1건당 LLM 호출 하드 예산.
                       교정 재시도 포함 모든 호출이 본 예산을 소비한다.
-                      정상 경로 소비 내역: 장소 선정 1 + 동선 1 +
-                      추천이유 1 = 3. 블로그 요약은 추천 파이프라인에서
-                      빠져 별도 파이프라인이 자기 예산
-                      (SUMMARY_MAX_LLM_CALLS)으로 돈다.
+                      정상 경로 소비 내역: 장소 선정 1 + 추천이유 1 = 2.
+                      동선은 좌표로 계산해 모델을 부르지 않는다. 남는 1은
+                      앞 단계가 형식을 한 번 어겼을 때 쓸 교정 재시도
+                      여력으로 비워 둔 것이다. 블로그 요약은 추천
+                      파이프라인에서 빠져 별도 파이프라인이 자기 예산
+                      (SUMMARY_MAX_LLM_CALLS)으로 돈다. 다만 일일 한도는
+                      두 파이프라인이 같은 카운터를 공유한다.
       GEMINI_TEMPERATURE: 생성 온도. 구조화 출력의 결정성을 위해 낮게 둔다.
       GEMINI_MAX_OUTPUT_TOKENS: 응답 토큰 상한. Gemini 2.5 계열은 thinking
                       토큰이 본 상한을 함께 소비하므로 과소 설정 시 JSON 이
@@ -123,6 +126,16 @@ class AgentSettings(BaseSettings):
                      응답이 형식을 벗어났을 때의 교정 재시도 1회로 2를
                      둔다. 추천 파이프라인의 예산과 분리돼 있어 요약이
                      추천 잡의 호출 여유를 잠식하지 않는다.
+
+    후보 절단 관련:
+      CANDIDATES_MAX_BASE / CANDIDATES_PER_DAY: 선정 프롬프트에 실을 후보
+                     수 상한을 max(BASE, 여행일수 × PER_DAY) 로 정한다.
+                     테마별로 hub 를 따로 부르고 합치는 구조라 테마 수에
+                     비례해 후보가 늘고 프롬프트 입력도 같이 커지는데,
+                     실제로 고르는 것은 일수 × 2~4 곳뿐이다. 절단은
+                     recommend_places 한 곳에서만 하며 실내/실외를 절반씩
+                     남겨, 채점이 실패해 정렬 없이 온 경우에도 실내 후보가
+                     통째로 잘리지 않게 한다.
 
     룰 엔진(hub `/v1/rules/*`) 관련:
       RULES_ENABLED: True(기본)면 rules_filter/score_and_rank 가 hub 룰
@@ -222,6 +235,18 @@ class AgentSettings(BaseSettings):
     SUMMARY_MAX_PLACES: int = 7
     # 본 호출 1 + 형식 이탈 시 교정 재시도 1.
     SUMMARY_MAX_LLM_CALLS: int = 2
+
+    # 선정 프롬프트에 실을 후보 수 상한. 테마마다 hub 를 따로 부르고 합치기
+    # 때문에 테마를 많이 고르면 후보가 선형으로 늘고, 그 전량이 프롬프트에
+    # 실려 입력이 커진다. 실제로 고르는 것은 일수 × 2~4 곳뿐이라 나머지는
+    # 읽히고 버려진다. 상한 = max(BASE, 여행일수 × PER_DAY).
+    CANDIDATES_MAX_BASE: int = 40
+    CANDIDATES_PER_DAY: int = 12
+
+    # 테마 친화 가점 스위치. False 면 score_and_rank 가 가점 0 으로 계산해
+    # 페이로드가 도입 전과 같아진다. 가점 자체가 score_and_rank 안에 있어
+    # RULES_ENABLED=false 일 때도 함께 꺼진다.
+    PERSONALIZATION_ENABLED: bool = True
 
     RULES_ENABLED: bool = True  # kill-switch — 장애 시 no-op 복귀
 

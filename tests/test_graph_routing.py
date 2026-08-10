@@ -17,13 +17,11 @@ from app.graph.agent_graph import build_graph
 from app.schemas.agent_schemas import (
     AgentRequest,
     DateRange,
-    Leg,
     Mobility,
     PlaceReason,
     PlaceSelection,
     PlacesSelection,
     ReasonEnvelope,
-    RouteEnvelope,
 )
 
 
@@ -139,24 +137,6 @@ def _selection(n: int) -> PlacesSelection:
             PlaceSelection(index=i, day=1, recommended_visit_time="오전")
             for i in range(n)
         ]
-    )
-
-
-def _route(n: int) -> RouteEnvelope:
-    return RouteEnvelope(
-        visit_order=list(range(n)),
-        legs=[
-            Leg.model_validate(
-                {
-                    "from": i,
-                    "to": i + 1,
-                    "mode": "walk",
-                    "estimated_distance_km": 1.0,
-                    "estimated_duration_min": 15,
-                }
-            )
-            for i in range(n - 1)
-        ],
     )
 
 

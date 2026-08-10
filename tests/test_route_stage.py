@@ -19,12 +19,10 @@ from app.schemas.agent_schemas import (
     AgentRequest,
     BulletsEnvelope,
     DateRange,
-    Leg,
     Mobility,
     PlaceBullets,
     PlaceReason,
     ReasonEnvelope,
-    RouteEnvelope,
     SelectedPlace,
 )
 
@@ -124,22 +122,6 @@ class _CapturePublisher:
         return "1-0"
 
 
-def _route_envelope(n: int) -> RouteEnvelope:
-    return RouteEnvelope(
-        visit_order=list(range(n)),
-        legs=[
-            Leg.model_validate({
-                "from": i,
-                "to": i + 1,
-                "mode": "walk",
-                "estimated_distance_km": 1.0,
-                "estimated_duration_min": 15,
-            })
-            for i in range(n - 1)
-        ],
-    )
-
-
 def _reason_envelope(n: int) -> ReasonEnvelope:
     return ReasonEnvelope(
         reasons=[PlaceReason(place_id=i, reason=f"이유{i}") for i in range(n)],
@@ -227,6 +209,46 @@ def test_load_given_places_numbers_in_request_order() -> None:
     # 방문 시각은 BFF 가 활동 시간대를 나눠 채우므로 비워 둔다.
     assert all(p.recommended_visit_time == "" for p in places)
     assert out["grounded"] is True
+
+
+def test_load_given_places_carries_category() -> None:
+    """호출 측이 되돌려 준 분류를 그대로 싣는다.
+
+    이 단계는 장소를 새로 찾지 않아 분류를 알아낼 길이 없다. 여기서 흘리면
+    화면의 분류 칩이 사라진다.
+    """
+    given = [
+        SelectedPlace(
+            name="속초해변", lat=38.19, lng=128.60,
+            category="여행 / 관광,명소 / 해수욕장,해변",
+        ),
+        SelectedPlace(name="영금정", lat=38.21, lng=128.60),
+    ]
+    state = {"job_id": "j", "request": _request(places=given)}
+    places = asyncio.run(load_given_places(state))["places"]
+
+    assert places[0].category == "여행 / 관광,명소 / 해수욕장,해변"
+    assert places[1].category is None
+
+
+def test_selected_place_tidies_category_instead_of_rejecting() -> None:
+    """분류는 표시용이라 거절하지 않고 다듬는다.
+
+    꺾쇠가 섞였다고 요청 전체를 막으면, 사용자가 본 적도 없는 글자 하나로
+    동선을 못 만들게 된다. 뒤이어 Place 가 거부하는 문자만 바꾼다.
+    """
+    tagged = SelectedPlace(
+        name="어딘가", lat=37.5, lng=127.0, category="음식점 > 카페",
+    )
+    assert tagged.category == "음식점 / 카페"
+
+    long_one = SelectedPlace(
+        name="어딘가", lat=37.5, lng=127.0, category="가" * 200,
+    )
+    assert len(long_one.category) == 80
+
+    blank = SelectedPlace(name="어딘가", lat=37.5, lng=127.0, category="   ")
+    assert blank.category is None
 
 
 def test_load_given_places_noop_on_error() -> None:
