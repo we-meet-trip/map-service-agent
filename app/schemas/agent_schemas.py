@@ -21,6 +21,8 @@ from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.security.sanitize import neutralize_tags
+
 # LLM 생성 텍스트 필드에서 거부하는 문자: 태그 문자(<, >)와 제어문자.
 # 프롬프트 인젝션 산출물이 페이로드를 타고 하류(클라이언트 렌더링,
 # 후속 프롬프트)로 흘러가는 것을 차단하는 최종 방어선이다.
@@ -36,6 +38,11 @@ _FORBIDDEN_TEXT_RE = re.compile(
     "\U000e0000-\U000e007f"                        # Unicode Tags 블록
     "]"
 )
+
+
+# 분류 문자열의 표시 상한. 요약 요청이 쓰는 값과 같게 맞춘다. 내보내는
+# 쪽에는 상한이 없으므로 거절이 아니라 이 길이로 자른다.
+_CATEGORY_MAX = 80
 
 
 def _reject_tags_and_control(value):
@@ -132,6 +139,10 @@ class SelectedPlace(BaseModel):
          받아야 한다.
     content_id: 실측 출처 식별자. 있으면 리뷰 조회에 그대로 쓰고, 없으면
                 이름으로 조회한다.
+    category: 장소 분류. 이 단계는 장소를 새로 찾지 않아 분류를 알 방법이
+              없으므로, 호출 측이 처음 받았던 값을 되돌려 준다. 표시용이라
+              너무 길거나 꺾쇠가 섞여 있어도 요청을 거절하지 않고 다듬는다 —
+              분류 한 줄 때문에 여행 전체가 실패하면 안 된다.
     """
     name: str = Field(min_length=1, max_length=80)
     address: str = Field(default="", max_length=200)
@@ -139,6 +150,7 @@ class SelectedPlace(BaseModel):
     lng: float = Field(ge=124.0, le=132.0)
     day: int = Field(default=1, ge=1)
     content_id: Optional[str] = Field(default=None, max_length=64)
+    category: Optional[str] = Field(default=None)
 
     @field_validator("day", mode="before")
     @classmethod
@@ -151,6 +163,20 @@ class SelectedPlace(BaseModel):
     def _blank_when_null(cls, value):
         """JSON `"address": null` 을 빈 문자열로 접는다."""
         return "" if value is None else value
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _tidy_category(cls, value):
+        """분류를 무해화하고 상한까지 자른다.
+
+        받는 값은 우리가 앞서 내보낸 표시용 문자열이다. 거절하면 사용자가
+        본 적도 없는 글자 때문에 동선 요청 전체가 막히므로, 뒤이어 Place 가
+        거부하는 문자만 바꾸고 길이를 맞춘다.
+        """
+        if not isinstance(value, str):
+            return value
+        tidy = neutralize_tags(value).strip()
+        return tidy[:_CATEGORY_MAX] or None
 
     _no_tags = field_validator("name", "address", "content_id")(
         _reject_tags_and_control

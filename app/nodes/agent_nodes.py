@@ -443,6 +443,9 @@ async def load_given_places(state: AgentState) -> AgentState:
             lng=p.lng,
             recommended_visit_time="",
             content_id=p.content_id,
+            # 이 단계는 장소를 새로 찾지 않아 분류를 알아낼 길이 없다.
+            # 호출 측이 처음 받았던 값을 되돌려 주므로 그대로 싣는다.
+            category=p.category,
             grounded=True,
         )
         for i, p in enumerate(ordered)

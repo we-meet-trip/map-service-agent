@@ -229,6 +229,46 @@ def test_load_given_places_numbers_in_request_order() -> None:
     assert out["grounded"] is True
 
 
+def test_load_given_places_carries_category() -> None:
+    """호출 측이 되돌려 준 분류를 그대로 싣는다.
+
+    이 단계는 장소를 새로 찾지 않아 분류를 알아낼 길이 없다. 여기서 흘리면
+    화면의 분류 칩이 사라진다.
+    """
+    given = [
+        SelectedPlace(
+            name="속초해변", lat=38.19, lng=128.60,
+            category="여행 / 관광,명소 / 해수욕장,해변",
+        ),
+        SelectedPlace(name="영금정", lat=38.21, lng=128.60),
+    ]
+    state = {"job_id": "j", "request": _request(places=given)}
+    places = asyncio.run(load_given_places(state))["places"]
+
+    assert places[0].category == "여행 / 관광,명소 / 해수욕장,해변"
+    assert places[1].category is None
+
+
+def test_selected_place_tidies_category_instead_of_rejecting() -> None:
+    """분류는 표시용이라 거절하지 않고 다듬는다.
+
+    꺾쇠가 섞였다고 요청 전체를 막으면, 사용자가 본 적도 없는 글자 하나로
+    동선을 못 만들게 된다. 뒤이어 Place 가 거부하는 문자만 바꾼다.
+    """
+    tagged = SelectedPlace(
+        name="어딘가", lat=37.5, lng=127.0, category="음식점 > 카페",
+    )
+    assert tagged.category == "음식점 / 카페"
+
+    long_one = SelectedPlace(
+        name="어딘가", lat=37.5, lng=127.0, category="가" * 200,
+    )
+    assert len(long_one.category) == 80
+
+    blank = SelectedPlace(name="어딘가", lat=37.5, lng=127.0, category="   ")
+    assert blank.category is None
+
+
 def test_load_given_places_noop_on_error() -> None:
     """앞 단계가 실패한 잡에서는 장소를 세우지 않는다."""
     state = {"job_id": "j", "request": _request(), "error": "boom"}
