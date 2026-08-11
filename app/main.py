@@ -215,9 +215,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # search_path 를 langgraph 스키마로 고정해 setup() 이 public
             # 에 테이블을 만들지 않도록 한다(AsyncPostgresSaver 는 스키마
             # 인자를 직접 받지 않는다 — conninfo options 로 지정).
+            # 빌려줄 때마다 연결이 살아 있는지 먼저 확인한다.
+            #
+            # 확인을 걸지 않으면 풀은 이미 끊긴 연결도 그대로 내준다. 끊긴 줄은
+            # 그 연결로 첫 질의를 던져 실패한 뒤에야 알게 되고, 그때는 이미 잡
+            # 하나가 죽은 뒤다. 풀은 실패한 연결을 버리고 새로 하나 채우므로,
+            # 끊긴 연결 수만큼 잡이 연달아 죽고 나서야 저절로 멎는다.
+            #
+            # 데이터베이스가 한 번 재기동하면 풀에 담긴 연결이 전부 이 상태가
+            # 된다. 확인을 걸어 두면 빌려주는 쪽에서 조용히 새 연결로 바꿔
+            # 주므로 잡은 한 건도 잃지 않는다. 대신 대여마다 왕복이 한 번 더
+            # 드는데, 이 풀은 추천 요청당 몇 번만 쓰여서 그 값이 싸다.
             checkpoint_pool = AsyncConnectionPool(
                 conninfo,
                 open=False,
+                check=AsyncConnectionPool.check_connection,
                 kwargs={
                     "autocommit": True,
                     "prepare_threshold": 0,
