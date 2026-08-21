@@ -288,6 +288,12 @@ class HubClient:
         await self._client.aclose()
 
 
+# 학습 신호 필드의 크기 상한(바이트). 후보 수십 개와 점수를 담아도 이 아래에
+# 들어오지만, 프롬프트 상한이 바뀌어 예상보다 커질 수 있다. Redis 는 메모리에
+# 들고 있으므로 한 건이 커지면 stream 전체가 함께 부푼다.
+TRAINING_FIELD_MAX_BYTES = 256 * 1024
+
+
 class StreamsPublisher:
     """Redis Streams XADD 발행자.
 
@@ -322,7 +328,11 @@ class StreamsPublisher:
         self._maxlen = maxlen
 
     async def publish(
-        self, job_id: str, status: str, payload_json: str
+        self,
+        job_id: str,
+        status: str,
+        payload_json: str,
+        training_json: str | None = None,
     ) -> str:
         """잡 1건의 결과를 stream 에 발행하고 메시지 id 를 돌려준다.
 
@@ -330,10 +340,19 @@ class StreamsPublisher:
           job_id: 잡 식별자. 메시지의 "job_id" 필드.
           status: "done" 또는 "failed". 메시지의 "status" 필드.
           payload_json: `JobDonePayload.model_dump_json(by_alias=True)` 결과.
+          training_json: 학습 신호(후보·점수·경로). 없으면 필드를 만들지 않는다.
+
+        학습 신호를 payload 에 섞지 않고 필드를 따로 두는 이유:
+          payload 는 BFF 가 초안으로 저장해 클라이언트 응답 본문으로 그대로
+          내보낸다. 후보 수십 개를 거기에 넣으면 모바일이 매번 그만큼을 더
+          받는다. 소비자는 필요한 키만 꺼내 읽으므로 필드가 늘어도 기존
+          소비자는 영향을 받지 않는다.
 
         동작:
           - `maxlen > 0` 이면 `maxlen=...`, `approximate=True` 인자를
             xadd 에 전달해 길이를 본 값 근처로 유지한다.
+          - 학습 신호가 상한을 넘으면 싣지 않는다. 한 건 때문에 stream 이
+            부풀어 정작 필요한 결과 전달이 밀리는 편이 더 나쁘다.
           - 성공 시 부여된 message id 를 그대로 반환.
 
         호출처:
@@ -344,18 +363,28 @@ class StreamsPublisher:
         if self._maxlen > 0:
             xadd_kwargs["maxlen"] = self._maxlen
             xadd_kwargs["approximate"] = True
+        fields: dict[str, str] = {
+            "job_id": job_id,
+            "status": status,
+            "payload": payload_json,
+        }
+        dropped = False
+        if training_json:
+            if len(training_json.encode("utf-8")) <= TRAINING_FIELD_MAX_BYTES:
+                fields["training"] = training_json
+            else:
+                dropped = True
         message_id = await self._client.xadd(
-            self._stream,
-            {
-                "job_id": job_id,
-                "status": status,
-                "payload": payload_json,
-            },
-            **xadd_kwargs,
+            self._stream, fields, **xadd_kwargs,
         )
+        if dropped:
+            logger.warning(
+                "training signal dropped (over %d bytes) job_id=%s",
+                TRAINING_FIELD_MAX_BYTES, job_id,
+            )
         logger.info(
-            "stream xadd id=%s job_id=%s status=%s",
-            message_id, job_id, status,
+            "stream xadd id=%s job_id=%s status=%s training=%s",
+            message_id, job_id, status, "training" in fields,
         )
         return message_id
 

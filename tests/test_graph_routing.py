@@ -113,7 +113,7 @@ class _CapturePublisher:
     def __init__(self) -> None:
         self.payloads: list[dict] = []
 
-    async def publish(self, job_id, status, payload_json):
+    async def publish(self, job_id, status, payload_json, training_json=None):
         self.payloads.append(json.loads(payload_json))
         return "1-0"
 

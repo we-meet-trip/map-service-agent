@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from datetime import date, timedelta
@@ -500,6 +501,15 @@ class AgentState(TypedDict):
     timeline_overflow_days: NotRequired[list[int]]
     warnings: NotRequired[list[str]]
     degraded_reason: NotRequired[str]
+    # 이번 결과를 어느 경로가 만들었는지: select / invent /
+    # select_then_invent / route. publish_done 이 학습 신호에 함께 실어
+    # 보낸다.
+    #
+    # degraded_reason 으로 대신할 수 없어 채널을 따로 둔다. 그 값은 하나뿐이라
+    # llm_reason 단계가 자기 사유로 덮어쓰고, 그러면 종착 노드에 닿았을 때는
+    # 선정이 창작으로 넘어갔다는 사실이 이미 지워져 있다. 후보 목록을 남겨도
+    # 그것을 실제로 쓴 경로를 모르면 목록의 의미가 정해지지 않는다.
+    selection_path: NotRequired[str]
     error: NotRequired[str]
 
 
@@ -585,6 +595,9 @@ async def load_given_places(state: AgentState) -> AgentState:
     if not selected:
         state["error"] = "stage=route requires places"
         return state
+    # 사용자가 직접 고른 경로다. 후보 목록도 랭킹도 거치지 않으므로 학습에서
+    # 다른 경로와 같이 묶으면 안 된다.
+    state["selection_path"] = "route"
     num_days = _num_days(req)
     ordered = sorted(selected, key=lambda p: min(p.day, num_days))
     state["places"] = [
@@ -1251,7 +1264,9 @@ async def recommend_places(state: AgentState) -> AgentState:
     if candidates:
         candidates = _cap_candidates(candidates, _candidate_limit(state))
         state["candidates"] = candidates
+        state["selection_path"] = "select"
         return await _select_places(state, candidates)
+    state["selection_path"] = "invent"
     return await _invent_places(state)
 
 
@@ -1539,6 +1554,8 @@ async def _select_places(
                 state.get("job_id"),
             )
             state["degraded_reason"] = "select_empty_fallback_to_invent"
+            # degraded_reason 은 뒤 단계가 자기 사유로 덮으므로 경로는 따로 남긴다.
+            state["selection_path"] = "select_then_invent"
             return await _invent_places(state)
         state["error"] = "recommend_places returned empty"
         return state
@@ -2228,6 +2245,75 @@ async def build_payload(state: AgentState) -> AgentState:
     return state
 
 
+# 학습 신호 계약의 판. 소비하는 쪽이 형태를 보고 갈라 읽을 수 있게 함께 싣는다.
+TRAINING_SCHEMA_VERSION = 1
+
+
+def _training_signal(state: AgentState) -> str | None:
+    """이번 잡이 남길 학습 신호를 JSON 문자열로 만든다. 없으면 None.
+
+    무엇을 담는가:
+      selection_path  이 결과를 만든 경로. 이것 없이는 후보 목록의 의미가
+                      정해지지 않는다 — 목록이 있어도 창작 경로로 넘어갔다면
+                      "고르지 않은 후보" 가 아니다.
+      candidates      프롬프트에 실제로 실린 후보. 노출 순위를 함께 남긴다.
+                      순위를 남기는 이유는, 나중에 "고르지 않은 것" 을 그대로
+                      부정 표본으로 쓰면 위에 있던 것이 뽑히기 쉬웠던 효과가
+                      선호로 둔갑하기 때문이다. 보정하려면 순위가 필요하다.
+      scores_pre_cap  룰 엔진이 매긴 점수. 이름에 pre_cap 을 박아 둔 이유는
+                      이 값이 후보를 자르기 전 집합을 기준으로 만들어져
+                      candidates 와 개수가 다르기 때문이다. 사람의 선호가
+                      아니라 기존 룰의 산출값이므로 학습의 정답으로 쓰면
+                      룰을 베끼는 것에 그친다. 진단용으로만 둔다.
+      grounded        실측 후보를 썼는지.
+
+    실패한 잡은 남기지 않는다. 무엇을 보고 무엇을 골랐는지가 없다.
+
+    모든 접근은 get 으로 한다. route 나 저하 경로에서는 후보·점수 키가 아예
+    없으며, 여기서 KeyError 가 나면 결과 발행 자체가 막힌다.
+    """
+    if state.get("error"):
+        return None
+    path = state.get("selection_path")
+    if not path:
+        return None
+
+    candidates = state.get("candidates") or []
+    signal: dict = {
+        "schema_version": TRAINING_SCHEMA_VERSION,
+        "path": path,
+        "grounded": bool(state.get("grounded")),
+        "model": get_settings().GEMINI_MODEL,
+        "candidate_count": len(candidates),
+        "candidates": [
+            {
+                "rank": i,
+                "content_id": c.get("content_id"),
+                "name": c.get("name"),
+                "category": c.get("category"),
+                "lat": c.get("lat"),
+                "lng": c.get("lng"),
+            }
+            for i, c in enumerate(candidates)
+            if isinstance(c, dict)
+        ],
+        "chosen_content_ids": [
+            p.content_id for p in (state.get("places") or [])
+            if getattr(p, "content_id", None)
+        ],
+    }
+    scores = state.get("scores")
+    if scores:
+        signal["scores_pre_cap"] = scores
+    try:
+        return json.dumps(signal, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as e:
+        # 신호를 못 만드는 것이 결과 발행을 막아서는 안 된다.
+        logger.warning("training signal build failed job_id=%s reason=%s",
+                       state.get("job_id"), type(e).__name__)
+        return None
+
+
 async def publish_done(state: AgentState) -> AgentState:
     """결과 페이로드를 Redis Streams 에 발행하는 종착 노드.
 
@@ -2272,5 +2358,6 @@ async def publish_done(state: AgentState) -> AgentState:
         job_id=job_id,
         status=payload.status,
         payload_json=payload.model_dump_json(by_alias=True),
+        training_json=_training_signal(state),
     )
     return state
