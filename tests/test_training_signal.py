@@ -138,6 +138,41 @@ class TestMissingKeys:
         assert _training_signal(state) is None
 
 
+class TestTokenUsage:
+    def test_토큰_수가_합계와_함께_남는다(self):
+        # 호출 횟수만으로는 필요한 컴퓨트를 알 수 없다. 후보를 수십 개 싣는
+        # 요청과 이유만 쓰는 요청이 크게 다르기 때문이다.
+        state = {
+            "job_id": "j1",
+            "selection_path": "select",
+            "places": [],
+            "llm_usage": [
+                {"prompt": 4000, "output": 1200, "total": 5200},
+                {"prompt": 900, "output": 2100, "total": 3000},
+            ],
+        }
+        signal = json.loads(_training_signal(state))
+        assert signal["llm_tokens"] == {
+            "calls": 2, "prompt": 4900, "output": 3300, "total": 8200,
+        }
+        assert len(signal["llm_usage"]) == 2
+
+    def test_토큰_수가_없으면_생략한다(self):
+        # 옛 판이나 계량을 못 받은 응답에서는 이 값이 없다.
+        state = {"job_id": "j1", "selection_path": "route", "places": []}
+        signal = json.loads(_training_signal(state))
+        assert "llm_tokens" not in signal
+
+    def test_일부_값이_비어도_더하기가_깨지지_않는다(self):
+        state = {
+            "job_id": "j1", "selection_path": "select", "places": [],
+            "llm_usage": [{"prompt": None, "output": 100, "total": None}],
+        }
+        signal = json.loads(_training_signal(state))
+        assert signal["llm_tokens"]["output"] == 100
+        assert signal["llm_tokens"]["prompt"] == 0
+
+
 class TestPayloadSeparation:
     def test_후보가_결과_본문에_섞이지_않는다(self):
         import asyncio

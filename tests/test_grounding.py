@@ -99,7 +99,7 @@ class _FakeGemini:
         self._result = result
 
     async def generate_structured(
-        self, prompt, schema, *, system_instruction=None
+        self, prompt, schema, *, system_instruction=None, usage_sink=None
     ):
         return self._result
 
@@ -288,7 +288,7 @@ class _SeqGemini:
         self.calls = 0
 
     async def generate_structured(
-        self, prompt, schema, *, system_instruction=None
+        self, prompt, schema, *, system_instruction=None, usage_sink=None
     ):
         self.calls += 1
         return self._results.pop(0)
@@ -445,7 +445,7 @@ class _SchemaSpyGemini:
         self.schemas: list[type] = []
 
     async def generate_structured(
-        self, prompt, schema, *, system_instruction=None
+        self, prompt, schema, *, system_instruction=None, usage_sink=None
     ):
         self.schemas.append(schema)
         return self._result

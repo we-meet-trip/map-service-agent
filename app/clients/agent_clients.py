@@ -425,6 +425,25 @@ class StreamsPublisher:
         await self._client.aclose()
 
 
+def _record_usage(resp, sink: list[dict] | None) -> None:
+    """응답에 실린 토큰 수를 목록에 덧붙인다. 없으면 아무 것도 하지 않는다.
+
+    SDK 판이나 모델에 따라 이 값이 비어 올 수 있어, 없다고 해서 호출을
+    실패로 보지 않는다 — 계량이 본 기능을 막아서는 안 된다.
+    """
+    if sink is None:
+        return
+    meta = getattr(resp, "usage_metadata", None)
+    if meta is None:
+        return
+    prompt = getattr(meta, "prompt_token_count", None)
+    output = getattr(meta, "candidates_token_count", None)
+    total = getattr(meta, "total_token_count", None)
+    if prompt is None and output is None and total is None:
+        return
+    sink.append({"prompt": prompt, "output": output, "total": total})
+
+
 class GeminiClient:
     """Gemini 모델 호출 클라이언트.
 
@@ -547,8 +566,15 @@ class GeminiClient:
         response_schema: Type[T],
         *,
         system_instruction: str | None = None,
+        usage_sink: list[dict] | None = None,
     ) -> T:
         """구조화(JSON) 응답을 Pydantic 모델로 검증해서 돌려준다.
+
+        usage_sink: 주면 이번 호출이 쓴 토큰 수를 여기에 덧붙인다.
+                    호출자가 자기 목록을 넘기므로 동시 호출이 섞이지 않는다
+                    (클라이언트에 마지막 값을 들고 있으면 섞인다).
+                    자체 모델로 옮길 때 필요한 컴퓨트를 이 값으로 가늠한다 —
+                    지금은 이 수치가 어디에도 남지 않아 짐작밖에 할 수 없다.
 
         prompt: 입력 프롬프트(데이터 태그로 격리된 user 콘텐츠).
         response_schema: 응답 스키마로 사용할 Pydantic 모델 클래스(예:
@@ -607,6 +633,7 @@ class GeminiClient:
             ),
             timeout=self._timeout,
         )
+        _record_usage(resp, usage_sink)
         body = resp.text or ""
         try:
             return response_schema.model_validate_json(body)

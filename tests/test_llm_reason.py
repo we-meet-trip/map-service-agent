@@ -62,7 +62,8 @@ class _SeqGemini:
         self.calls = 0
         self.prompts: list[str] = []
 
-    async def generate_structured(self, prompt, schema, *, system_instruction=None):
+    async def generate_structured(self, prompt, schema, *, system_instruction=None,
+                                  usage_sink=None):
         self.calls += 1
         self.prompts.append(prompt)
         item = self._results.pop(0)

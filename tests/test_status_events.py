@@ -87,7 +87,8 @@ class _SeqGemini:
     def __init__(self, results: list) -> None:
         self._results = list(results)
 
-    async def generate_structured(self, prompt, schema, *, system_instruction=None):
+    async def generate_structured(self, prompt, schema, *, system_instruction=None,
+                                  usage_sink=None):
         return self._results.pop(0)
 
 

@@ -492,6 +492,10 @@ class AgentState(TypedDict):
     visit_order: NotRequired[list[int]]
     legs: NotRequired[list[Leg]]
     llm_calls_used: NotRequired[int]
+    # 이번 요청이 실제로 쓴 토큰 수. 호출마다 한 항목씩 쌓인다.
+    # 자체 모델로 옮길 때 필요한 컴퓨트를 이 값으로 가늠한다 — 호출 횟수만으로는
+    # 알 수 없다. 후보를 수십 개 싣는 요청과 이유만 쓰는 요청이 크게 다르다.
+    llm_usage: NotRequired[list[dict]]
     reasons: NotRequired[dict[int, str]]
     clothing: NotRequired[str]
     summaries: NotRequired[dict[int, list[str]]]
@@ -2305,6 +2309,18 @@ def _training_signal(state: AgentState) -> str | None:
     scores = state.get("scores")
     if scores:
         signal["scores_pre_cap"] = scores
+
+    usage = state.get("llm_usage") or []
+    if usage:
+        # 호출별로도 남기고 합계도 함께 둔다. 합계만 두면 어느 단계가 큰지
+        # 알 수 없고, 호출별만 두면 읽는 쪽이 매번 더해야 한다.
+        signal["llm_usage"] = usage
+        signal["llm_tokens"] = {
+            "calls": len(usage),
+            "prompt": sum(u.get("prompt") or 0 for u in usage),
+            "output": sum(u.get("output") or 0 for u in usage),
+            "total": sum(u.get("total") or 0 for u in usage),
+        }
     try:
         return json.dumps(signal, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as e:

@@ -43,7 +43,7 @@ class _SeqGemini:
         self.last_prompt = ""
 
     async def generate_structured(
-        self, prompt, schema, *, system_instruction=None
+        self, prompt, schema, *, system_instruction=None, usage_sink=None
     ):
         self.calls += 1
         self.last_prompt = prompt

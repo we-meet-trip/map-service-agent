@@ -101,7 +101,8 @@ class _SeqGemini:
         self._results = list(results)
         self.calls = 0
 
-    async def generate_structured(self, prompt, schema, *, system_instruction=None):
+    async def generate_structured(self, prompt, schema, *, system_instruction=None,
+                                  usage_sink=None):
         self.calls += 1
         item = self._results.pop(0)
         if isinstance(item, Exception):
