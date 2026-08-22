@@ -2250,7 +2250,11 @@ async def build_payload(state: AgentState) -> AgentState:
 
 
 # 학습 신호 계약의 판. 소비하는 쪽이 형태를 보고 갈라 읽을 수 있게 함께 싣는다.
-TRAINING_SCHEMA_VERSION = 1
+#
+# 2: 요청 조건(request)·랭킹 설정(ranking_config)·후보의 분류 코드를 더했다.
+#    앞의 둘이 없으면 "무엇을 물었을 때 무엇이 뽑혔는가" 가 성립하지 않고,
+#    코드가 없으면 그 잡의 랭킹을 나중에 다시 돌려볼 수 없다.
+TRAINING_SCHEMA_VERSION = 2
 
 
 def _training_signal(state: AgentState) -> str | None:
@@ -2270,6 +2274,14 @@ def _training_signal(state: AgentState) -> str | None:
                       아니라 기존 룰의 산출값이므로 학습의 정답으로 쓰면
                       룰을 베끼는 것에 그친다. 진단용으로만 둔다.
       grounded        실측 후보를 썼는지.
+      request         이번 요청의 조건(기간·시간대·예산·테마·이동수단·지역).
+                      학습의 입력이 되는 값이다. 이것이 없으면 후보와 선택만
+                      남아 "무엇을 물었길래 이렇게 뽑혔는가" 를 되짚을 수 없다.
+                      프롬프트에 싣는 것과 같은 새니타이즈를 거친 뷰를 쓴다.
+      ranking_config  이 잡이 어떤 랭킹 설정에서 나왔는지. 개인화나 룰을 켜고
+                      끄면 같은 조건에서도 다른 결과가 나오는데, 그 사실이
+                      남지 않으면 설정이 바뀐 앞뒤 데이터가 한 덩어리로 섞인다.
+                      나중에 추가할 수 없는 값이라 처음부터 함께 남긴다.
 
     실패한 잡은 남기지 않는다. 무엇을 보고 무엇을 골랐는지가 없다.
 
@@ -2282,12 +2294,13 @@ def _training_signal(state: AgentState) -> str | None:
     if not path:
         return None
 
+    settings = get_settings()
     candidates = state.get("candidates") or []
     signal: dict = {
         "schema_version": TRAINING_SCHEMA_VERSION,
         "path": path,
         "grounded": bool(state.get("grounded")),
-        "model": get_settings().GEMINI_MODEL,
+        "model": settings.GEMINI_MODEL,
         "candidate_count": len(candidates),
         "candidates": [
             {
@@ -2295,6 +2308,9 @@ def _training_signal(state: AgentState) -> str | None:
                 "content_id": c.get("content_id"),
                 "name": c.get("name"),
                 "category": c.get("category"),
+                # 랭킹이 실제로 보는 키다. 표시용 category 문자열만 남기면
+                # 나중에 같은 랭킹을 다시 돌려도 다른 결과가 나온다.
+                "category_group_code": c.get("category_group_code"),
                 "lat": c.get("lat"),
                 "lng": c.get("lng"),
             }
@@ -2306,6 +2322,18 @@ def _training_signal(state: AgentState) -> str | None:
             if getattr(p, "content_id", None)
         ],
     }
+    # 요청은 AgentRequest 일 때만 싣는다. 이 함수는 요청이 없는 상태(저하
+    # 경로·시험)로도 불리므로, 있다고 단정하면 그 자리에서 결과 발행이 막힌다.
+    req = state.get("request")
+    if isinstance(req, AgentRequest):
+        signal["request"] = _safe_request_view(req)
+
+    # 켜고 끄는 스위치의 그때 상태. 값이 아니라 상태를 남긴다.
+    signal["ranking_config"] = {
+        "personalization_enabled": bool(settings.PERSONALIZATION_ENABLED),
+        "rules_enabled": bool(settings.RULES_ENABLED),
+    }
+
     scores = state.get("scores")
     if scores:
         signal["scores_pre_cap"] = scores

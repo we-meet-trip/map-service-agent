@@ -207,3 +207,116 @@ class TestPayloadSeparation:
         assert "candidates" not in captured["payload"]
         # 같은 정보는 별도 필드에만 실린다.
         assert "후보0" in captured["training"]
+
+
+class TestRequestAndConfig:
+    """요청 조건과 랭킹 설정이 함께 남는지.
+
+    이 둘은 나중에 채울 수 없는 값이다. 요청 조건이 없으면 후보와 선택만 남아
+    "무엇을 물었길래 이렇게 뽑혔는가" 가 성립하지 않고, 랭킹 설정이 없으면
+    스위치를 켜고 끈 앞뒤의 데이터가 구분 없이 한 덩어리가 된다.
+    """
+
+    def _request(self):
+        from app.schemas.agent_schemas import AgentRequest
+
+        return AgentRequest(
+            date={
+                "date_start": "2026-09-05",
+                "date_end": "2026-09-05",
+                "time_start": "10:00:00",
+                "time_end": "18:00:00",
+            },
+            budget=100000,
+            theme=["food", "cafe"],
+            mobility="walk",
+            province="서울특별시",
+            city="종로구",
+        )
+
+    def test_요청조건이_남는다(self):
+        state = {
+            "job_id": "j1",
+            "selection_path": "select",
+            "grounded": True,
+            "candidates": _candidates(2),
+            "places": [_place(0, "c0")],
+            "request": self._request(),
+        }
+        signal = json.loads(_training_signal(state))
+
+        req = signal["request"]
+        assert req["date"]["date_start"] == "2026-09-05"
+        assert req["budget_krw"] == 100000
+        assert req["theme"] == ["food", "cafe"]
+        assert req["mobility"] == "walk"
+        assert req["province"] == "서울특별시"
+        assert req["city"] == "종로구"
+
+    def test_요청이_없어도_터지지_않는다(self):
+        # 저하 경로와 기존 호출들은 요청 없이 이 함수를 부른다. 있다고 단정하면
+        # 그 자리에서 결과 발행 자체가 막힌다.
+        state = {
+            "job_id": "j1",
+            "selection_path": "route",
+            "grounded": True,
+            "places": [_place(0, "c0")],
+        }
+        signal = json.loads(_training_signal(state))
+
+        assert "request" not in signal
+
+    def test_요청자리에_엉뚱한_값이_있어도_무시한다(self):
+        # 상태를 손으로 만드는 자리(시험·재현 스크립트)에서 흔한 모양이다.
+        state = {
+            "job_id": "j1",
+            "selection_path": "select",
+            "grounded": True,
+            "candidates": _candidates(1),
+            "places": [_place(0, "c0")],
+            "request": {"province": "서울특별시"},
+        }
+        signal = json.loads(_training_signal(state))
+
+        assert "request" not in signal
+
+    def test_랭킹설정이_항상_남는다(self):
+        state = {
+            "job_id": "j1",
+            "selection_path": "select",
+            "grounded": True,
+            "candidates": _candidates(1),
+            "places": [_place(0, "c0")],
+        }
+        signal = json.loads(_training_signal(state))
+
+        cfg = signal["ranking_config"]
+        assert isinstance(cfg["personalization_enabled"], bool)
+        assert isinstance(cfg["rules_enabled"], bool)
+
+    def test_후보에_분류코드가_남는다(self):
+        # 랭킹이 실제로 보는 키다. 이것 없이는 같은 잡의 랭킹을 나중에 다시
+        # 돌려도 다른 결과가 나온다.
+        state = {
+            "job_id": "j1",
+            "selection_path": "select",
+            "grounded": True,
+            "candidates": [
+                {
+                    "content_id": "c0",
+                    "name": "후보0",
+                    "category": "음식점 > 카페",
+                    "category_group_code": "CE7",
+                    "lat": 37.5,
+                    "lng": 127.0,
+                }
+            ],
+            "places": [_place(0, "c0")],
+        }
+        signal = json.loads(_training_signal(state))
+
+        assert signal["candidates"][0]["category_group_code"] == "CE7"
+
+    def test_계약판이_2다(self):
+        # 읽는 쪽이 판을 보고 갈라 읽는다. 필드를 더했으면 판도 올라가야 한다.
+        assert TRAINING_SCHEMA_VERSION == 2
