@@ -1,0 +1,15 @@
+{
+  "id": "gangneung-car-2d",
+  "note": "자동차. 반경 개념이 맞지 않아 그 축은 재지 않는다.",
+  "request": {
+    "province": "강원특별자치도",
+    "city": "강릉시",
+    "days": 2,
+    "mobility": "car"
+  },
+  "expect": {
+    "time_start": "09:00",
+    "time_end": "20:00",
+    "grounded": true
+  }
+}

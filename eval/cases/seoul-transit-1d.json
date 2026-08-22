@@ -1,0 +1,15 @@
+{
+  "id": "seoul-transit-1d",
+  "note": "대중교통. 반경 무제한 통과.",
+  "request": {
+    "province": "서울특별시",
+    "city": "마포구",
+    "days": 1,
+    "mobility": "transit"
+  },
+  "expect": {
+    "time_start": "11:00",
+    "time_end": "22:00",
+    "grounded": true
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "seoul-walk-1d",
+  "note": "도보 하루. 반경 3km 안에 머물러야 한다.",
+  "request": {
+    "province": "서울특별시",
+    "city": "강남구",
+    "days": 1,
+    "mobility": "walk"
+  },
+  "expect": {
+    "max_radius_km": 3.0,
+    "time_start": "10:00",
+    "time_end": "20:00",
+    "grounded": true
+  }
+}
