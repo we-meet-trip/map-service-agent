@@ -286,6 +286,61 @@ _AFFINITY_MAX = 0.10
 _AFFINITY_DECAY = 0.7
 
 
+# 세어 둔 성향별 저장 비율. 처음 쓸 때 한 번 읽고 들고 있는다.
+#
+# 매번 읽지 않는 이유: 요청마다 파일을 열면 그만큼 느려지고, 도는 중에 파일이
+# 바뀌면 같은 요청이 앞뒤로 다른 점수를 받는다. 바뀐 통계는 다시 띄울 때 든다.
+_SEGMENT_STATS: dict | None = None
+_SEGMENT_STATS_LOADED = False
+
+
+def _segment_stats() -> dict:
+    """세어 둔 통계를 돌려준다. 없으면 빈 것."""
+    global _SEGMENT_STATS, _SEGMENT_STATS_LOADED
+    if _SEGMENT_STATS_LOADED:
+        return _SEGMENT_STATS or {}
+    _SEGMENT_STATS_LOADED = True
+    path = get_settings().SEGMENT_STATS_PATH
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            _SEGMENT_STATS = json.load(f)
+        segments = (_SEGMENT_STATS or {}).get("segments") or {}
+        logger.info("segment stats loaded segments=%d path=%s", len(segments), path)
+    except (OSError, ValueError) as e:
+        # 통계를 못 읽는 것이 추천을 막아서는 안 된다. 없는 것으로 친다.
+        logger.warning("segment stats load failed path=%s reason=%s",
+                       path, type(e).__name__)
+        _SEGMENT_STATS = None
+    return _SEGMENT_STATS or {}
+
+
+def _segment_gain(candidate: dict, segment: dict | None) -> float:
+    """이 사람 묶음이 이 곳을 남긴 비율만큼의 가점(0 ~ _AFFINITY_MAX).
+
+    문턱을 못 넘어 통계에 없는 곳은 0 이다. 한두 번의 우연을 취향으로 굳히지
+    않으려는 것이고, 그 판정은 통계를 만드는 쪽에서 이미 끝났다.
+    """
+    if not segment:
+        return 0.0
+    cid = candidate.get("content_id")
+    if not cid:
+        return 0.0
+    entry = (segment.get("places") or {}).get(cid)
+    if not entry:
+        return 0.0
+    return _AFFINITY_MAX * float(entry.get("rate") or 0.0)
+
+
+def _segment_for(age_band: str | None, gender: str | None) -> dict | None:
+    """요청자의 성향 묶음에 해당하는 통계 칸. 없으면 None."""
+    stats = _segment_stats()
+    segments = stats.get("segments") or {}
+    key = f"{age_band or 'unknown'}|{gender or 'unknown'}"
+    return segments.get(key)
+
+
 def _affinity(candidate: dict, themes: list[str] | None) -> float:
     """후보 한 건의 테마 친화 가점(0 ~ _AFFINITY_MAX).
 
@@ -1195,12 +1250,22 @@ async def score_and_rank(state: AgentState) -> AgentState:
         if settings.PERSONALIZATION_ENABLED
         else None
     )
+    # 요청에는 성향이 실리지 않는다(B2 계약을 바꾸지 않기로 했다). 지금은
+    # 묶음을 모르므로 "모름" 칸을 본다 — 자료가 쌓이면 그 칸에도 값이 생긴다.
+    segment = (
+        _segment_for(None, None)
+        if settings.PERSONALIZATION_ENABLED
+        else None
+    )
     pois = [
         {
             "content_id": c["content_id"],
             "indoor_flag": c.get("category_group_code")
             in _INDOOR_CATEGORY_GROUPS,
-            "base_score": 1.0 - 0.01 * i + _affinity(c, themes),
+            # 취향 가점과 세어 둔 가점 중 큰 것만 쓴다. 합하면 상한(0.10)을
+            # 넘어 "날씨가 취향을 이긴다"(실내 가점 0.15) 는 규약이 깨진다.
+            "base_score": 1.0 - 0.01 * i
+            + max(_affinity(c, themes), _segment_gain(c, segment)),
         }
         for i, c in enumerate(candidates)
         if isinstance(c, dict) and c.get("content_id")

@@ -1,0 +1,8 @@
+{
+  "cases": 6,
+  "schema_ok_ratio": 1.0,
+  "invented_ratio": 0.0,
+  "rule_clean_ratio": 1.0,
+  "route_ok_ratio": 1.0,
+  "timeline_ok_ratio": 1.0
+}

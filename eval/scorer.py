@@ -137,11 +137,22 @@ def score_timeline(payload: dict[str, Any],
                    time_end: str | None) -> dict[str, Any]:
     """방문 시각이 하루 안에서 앞뒤가 맞는가.
 
-    같은 날 안에서 시작 시각이 뒤로만 가는지, 활동 시간대를 벗어나지 않는지를
+    같은 날 안에서 시각이 앞으로만 가는지, 활동 시간대를 벗어나지 않는지를
     본다. 시각이 비어 있는 결과(경로 전용 등)는 잴 것이 없다고 표시한다.
+
+    비교는 <b>방문 순서대로</b> 한다. 결과에 담긴 배열 순서는 들르는 순서가
+    아니라서, 그대로 읽으면 앞뒤가 멀쩡한 일정도 역행으로 잡힌다.
     """
     places = payload.get("places") or []
-    timed = [p for p in places if p.get("visit_start")]
+    # 방문 순서대로 늘어놓고 본다. 배열에 담긴 순서는 들르는 순서가 아니다 —
+    # 그대로 읽으면 멀쩡한 일정이 시각 역행으로 잡힌다(실측: 6건 전부).
+    order = payload.get("visit_order")
+    if isinstance(order, list) and order:
+        by_id = {p.get("place_id"): p for p in places if isinstance(p, dict)}
+        ordered = [by_id[i] for i in order if i in by_id]
+    else:
+        ordered = [p for p in places if isinstance(p, dict)]
+    timed = [p for p in ordered if p.get("visit_start")]
     if not timed:
         return {"applicable": False}
 

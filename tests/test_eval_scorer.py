@@ -150,3 +150,75 @@ class TestRegressionCompare:
     def test_이번에_재지_못한_축을_잡아낸다(self):
         # 재지 못한 것을 조용히 넘기면, 축이 사라진 것이 통과로 보인다.
         assert compare({}, {"rule_clean_ratio": 1.0}, 0.05)
+
+
+class TestTimelineUsesVisitOrder:
+    """시각을 방문 순서대로 견주는지.
+
+    결과에 담긴 배열 순서는 들르는 순서가 아니다. 그대로 읽으면 앞뒤가 멀쩡한
+    일정도 역행으로 잡히는데, 실제로 그래서 여섯 건이 전부 빨간 불이었다.
+    """
+
+    def _payload(self, visit_order, times):
+        return {
+            "status": "done",
+            "places": [
+                {
+                    "place_id": i,
+                    "day": 1,
+                    "name": f"곳{i}",
+                    "address": "주소",
+                    "lat": 37.5,
+                    "lng": 127.0,
+                    "recommended_visit_time": t,
+                    "visit_start": t,
+                }
+                for i, t in enumerate(times)
+            ],
+            "visit_order": visit_order,
+            "legs": [],
+        }
+
+    def test_배열이_뒤섞여도_방문_순서가_맞으면_통과(self):
+        from app.nodes import agent_nodes  # noqa: F401  (import 경로 확인용)
+        from eval.scorer import score_timeline
+
+        # 배열로 읽으면 10:00 → 15:56 → 11:15 로 역행이지만,
+        # 실제로 들르는 순서는 10:00 → 11:15 → 15:56 이다.
+        payload = self._payload([0, 2, 1], ["10:00", "15:56", "11:15"])
+
+        result = score_timeline(payload, "10:00", "20:00")
+
+        assert result["applicable"] is True
+        assert result["ok"] is True, result["problems"]
+
+    def test_방문_순서로도_역행이면_잡는다(self):
+        from eval.scorer import score_timeline
+
+        payload = self._payload([0, 1, 2], ["10:00", "15:56", "11:15"])
+
+        result = score_timeline(payload, "10:00", "20:00")
+
+        assert result["ok"] is False
+        assert any("역행" in p for p in result["problems"])
+
+    def test_방문_순서가_없으면_배열_순서를_쓴다(self):
+        # 옛 결과에는 순서가 없을 수 있다. 그때도 재기는 해야 한다.
+        from eval.scorer import score_timeline
+
+        payload = self._payload([], ["10:00", "11:15", "12:00"])
+        payload.pop("visit_order")
+
+        result = score_timeline(payload, "10:00", "20:00")
+
+        assert result["ok"] is True
+
+    def test_활동_시간대_밖은_여전히_잡는다(self):
+        from eval.scorer import score_timeline
+
+        payload = self._payload([0, 1], ["10:00", "23:30"])
+
+        result = score_timeline(payload, "10:00", "20:00")
+
+        assert result["ok"] is False
+        assert any("종료" in p for p in result["problems"])
