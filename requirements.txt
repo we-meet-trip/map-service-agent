@@ -43,3 +43,9 @@ redis>=7.4.0,<8.0
 #   - app/clients/agent_clients.py GeminiClient 가 `from google import genai`,
 #     `from google.genai import types as genai_types` 로 사용.
 google-genai==2.3.0
+
+# [Crypto]
+# cryptography: 다른 서비스로 보낼 좌표를 봉투에 담는다.
+#   표준 라이브러리에는 대칭 암호가 없어 이 하나를 들인다. 직접 구현하는
+#   선택지는 두지 않는다 — 인증 암호는 미묘하게 틀려도 겉으로는 동작한다.
+cryptography==45.0.7

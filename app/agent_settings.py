@@ -220,6 +220,12 @@ class AgentSettings(BaseSettings):
     HUB_BASE_URL: str = "http://hub:8000"
     HUB_TIMEOUT_SECONDS: float = 5.0
     INTERNAL_SERVICE_TOKEN: SecretStr | None = None
+
+    # 서비스 사이로 나가는 좌표를 감싸는 열쇠. hub·BFF 와 같은 값을 나눠 가진다.
+    # 값이 있으면 좌표를 감싸서 보내고, 없으면 예전처럼 값 그대로 보낸다 —
+    # 받는 쪽이 아직 열 줄 모르는 동안 넘어가기 위한 것이다.
+    # 32바이트로 풀리는 base64 여야 한다: openssl rand -base64 32
+    LOCATION_WIRE_KEY: SecretStr = SecretStr("")
     AUTH_ENFORCED: bool = False
 
     REVIEWS_ENRICH_ENABLED: bool = True
