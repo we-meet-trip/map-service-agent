@@ -25,6 +25,8 @@ import httpx
 import redis.asyncio as aioredis
 from pydantic import BaseModel
 
+from app.crypto import location_seal
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
@@ -222,11 +224,23 @@ class HubClient:
         반환: hub 응답 본문 dict. filtered/radius_m/dropped 키를 가진다.
         호출처: `agent_nodes.rules_filter` 노드(예외는 저하로 흡수).
         """
-        body = {
-            "origin": origin,
-            "mobility": mobility,
-            "candidates": candidates,
-        }
+        # 좌표는 감싸서 보낸다. 출발지와 후보 모두 좌표를 담고 있어, 값
+        # 그대로 실으면 요청 본문과 중간에 남는 기록에 그대로 드러난다.
+        # 열쇠가 없으면 예전처럼 값으로 보낸다 — 받는 쪽이 아직 열 줄 모르는
+        # 동안 넘어가기 위한 길이다.
+        if location_seal.enabled():
+            body = {
+                "mobility": mobility,
+                "loc": location_seal.seal(
+                    {"origin": origin, "candidates": candidates}
+                ),
+            }
+        else:
+            body = {
+                "origin": origin,
+                "mobility": mobility,
+                "candidates": candidates,
+            }
         r = await self._client.post(
             f"{self._base}/v1/rules/filter/mobility-radius", json=body
         )
@@ -344,12 +358,21 @@ class StreamsPublisher:
         if self._maxlen > 0:
             xadd_kwargs["maxlen"] = self._maxlen
             xadd_kwargs["approximate"] = True
+        # 본문에는 방문지 좌표와 이름이 들어 있다. 스트림은 최근 것을 계속
+        # 들고 있어, 값 그대로 넣으면 그만큼의 이동 계획이 그대로 남는다.
+        # 열쇠가 없으면 예전처럼 값으로 넣는다 — 받는 쪽이 아직 열 줄 모르는
+        # 동안 넘어가기 위한 길이다.
+        body = (
+            location_seal.seal({"payload": payload_json})
+            if location_seal.enabled()
+            else payload_json
+        )
         message_id = await self._client.xadd(
             self._stream,
             {
                 "job_id": job_id,
                 "status": status,
-                "payload": payload_json,
+                "payload": body,
             },
             **xadd_kwargs,
         )
