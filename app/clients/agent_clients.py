@@ -335,6 +335,15 @@ class StreamsPublisher:
         self._stream = stream
         self._maxlen = maxlen
 
+    async def ping(self) -> bool:
+        """저장소가 답하는지 본다. 답하지 않으면 False."""
+        try:
+            await self._client.ping()
+            return True
+        except Exception as e:
+            logger.warning("streams ping failed err=%s", e)
+            return False
+
     async def publish(
         self, job_id: str, status: str, payload_json: str
     ) -> str:

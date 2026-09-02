@@ -34,6 +34,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.agent_dependencies import (
@@ -264,6 +265,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "CHECKPOINT_ENABLED=false to boot without it)"
             ) from e
 
+    app.state.checkpoint_pool = checkpoint_pool
     app.state.graph = build_graph(checkpointer=checkpointer)
     app.state.bg_tasks: set[asyncio.Task] = set()
     app.state.job_timeout_seconds = settings.JOB_TIMEOUT_SECONDS
@@ -369,6 +371,44 @@ async def health() -> dict[str, str]:
     않으며, 프로세스가 살아 있고 ASGI 가 응답 가능한지만 본다.
     """
     return {"status": "ok", "service": "agent"}
+
+
+@app.get("/health/ready")
+async def health_ready() -> JSONResponse:
+    """바깥 저장소까지 닿는지 본다.
+
+    위의 /health 는 과정이 살아 있다는 것만 알린다. 저장소가 끊겨도 그 쪽은
+    계속 200 을 돌려주므로, 일을 받을 수 없는 상태가 정상으로 보인다. 여기서는
+    실제로 한 번씩 물어보고, 하나라도 답하지 않으면 503 으로 알린다.
+
+    이어 붙이기를 꺼 두면 표를 아예 쓰지 않는다. 그때는 없는 의존을 있다고
+    적지 않는다. hub 는 묻지 않는다. 옆 서비스가 잠깐 내려간 것 때문에 이 쪽까지
+    못 쓰는 것으로 표시되면 장애 하나가 둘로 늘어난다.
+    """
+    deps: dict[str, str] = {}
+
+    try:
+        deps["streams"] = "ok" if await get_streams_publisher().ping() else "down"
+    except RuntimeError:
+        deps["streams"] = "down"
+
+    pool = getattr(app.state, "checkpoint_pool", None)
+    if pool is None:
+        deps["checkpoint"] = "disabled"
+    else:
+        try:
+            async with pool.connection() as conn:
+                await conn.execute("select 1")
+            deps["checkpoint"] = "ok"
+        except Exception as e:
+            logger.warning("readiness: checkpoint store unreachable err=%s", e)
+            deps["checkpoint"] = "down"
+
+    ready = "down" not in deps.values()
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ok" if ready else "degraded", "service": "agent", "deps": deps},
+    )
 
 
 async def _publish_failure(job_id: str, error: str) -> None:
