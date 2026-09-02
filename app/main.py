@@ -44,6 +44,7 @@ from app.agent_dependencies import (
     set_status_publisher,
     set_streams_publisher,
 )
+from app.crypto import location_seal
 from app.agent_settings import get_settings
 from app.clients.agent_clients import (
     GeminiClient,
@@ -453,6 +454,36 @@ async def _run_job(
         await _publish_failure(job_id, str(e))
 
 
+def _resolve_places(req: AgentRequest) -> AgentRequest:
+    """고른 장소를 봉투에서 꺼낸다.
+
+    열쇠가 설정돼 있으면 봉투만 받는다. 평문으로 온 좌표를 그대로 받아 주면
+    봉투를 만들 수 있다는 것이 자격이 되는 구조가 무너진다 — 열쇠 없이도
+    같은 요청을 만들 수 있게 되기 때문이다.
+
+    열쇠가 없으면 예전처럼 평문을 받는다. 양쪽이 준비되기 전에 넘어가기 위한
+    자리이고, 둘 다 켜지면 이 갈래는 지나가지 않는다.
+    """
+    if not location_seal.enabled():
+        return req
+    if not req.loc:
+        # 좌표가 아예 없는 요청은 그대로 간다. 첫 단계는 고른 장소가 없다.
+        if not req.places:
+            return req
+        # 열쇠가 있는데 평문으로 왔다. 봉투를 만들 줄 아는 쪽만 이 경로를
+        # 쓸 수 있어야 하므로 받지 않는다.
+        raise HTTPException(status_code=400, detail="invalid location")
+    try:
+        opened = location_seal.open_seal(req.loc)
+    except location_seal.SealError:
+        raise HTTPException(status_code=400, detail="invalid location")
+    places = opened.get("places")
+    if not isinstance(places, list):
+        raise HTTPException(status_code=400, detail="invalid location")
+    logger.info("location seal opened path=/v1/recommend places=%d", len(places))
+    return req.model_copy(update={"places": places, "loc": None})
+
+
 @app.post(
     "/v1/recommend",
     response_model=AgentJobAccepted,
@@ -483,6 +514,7 @@ async def recommend(
         실제 결과는 Redis Streams `agent:jobs:done` 으로 비동기 게시된다.
     """
     _verify_internal_token(x_internal_token)
+    req = _resolve_places(req)
     if not hasattr(app.state, "graph"):
         raise HTTPException(
             status_code=503, detail="graph not ready"
