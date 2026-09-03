@@ -28,6 +28,10 @@ langchain-core==1.4.0
 # langgraph-checkpoint-postgres
 #   - 영속 체크포인터용. 현재 코드에서는 직접 import 하지 않지만 LangGraph 영속화 옵션을 위해 설치.
 langgraph-checkpoint-postgres==3.1.0
+# langgraph-checkpoint
+#   - langgraph 가 끌어오는 내부 의존이지만, app/main.py 가 체크포인트를 봉하는
+#     `EncryptedSerializer` 를 직접 import 하게 되어 명시 핀.
+langgraph-checkpoint==4.2.0
 # langsmith
 #   - LangGraph 실행 추적 SDK. 직접 import 없이 환경변수로 자동 연동된다.
 langsmith>=0.4.0,<1.0

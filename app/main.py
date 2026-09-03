@@ -199,8 +199,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     checkpoint_pool = None
     if settings.CHECKPOINT_ENABLED:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        from langgraph.checkpoint.serde.encrypted import EncryptedSerializer
         from psycopg.rows import dict_row
         from psycopg_pool import AsyncConnectionPool
+
+        from app.crypto.checkpoint_seal import build_cipher
 
         schema = settings.LANGGRAPH_SCHEMA
         if not schema.isidentifier():
@@ -214,6 +217,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             f"/{settings.POSTGRES_DB}"
         )
         try:
+            # 체크포인트에 실리는 대화 상태에는 좌표가 담긴다. 저장 전에
+            # 봉하도록 serde 를 갈아 끼우고, 봉인 열쇠가 없거나 잘못돼
+            # 있으면 여기서 부팅을 막는다 — 평문으로 저장하는 폴백은 두지
+            # 않는다. 옛 평문 기록은 표식이 없어 읽기 경로를 그대로 통과.
+            serde = EncryptedSerializer(cipher=build_cipher(settings))
             # search_path 를 langgraph 스키마로 고정해 setup() 이 public
             # 에 테이블을 만들지 않도록 한다(AsyncPostgresSaver 는 스키마
             # 인자를 직접 받지 않는다 — conninfo options 로 지정).
@@ -244,7 +252,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await conn.execute(
                     f"CREATE SCHEMA IF NOT EXISTS {schema}"
                 )
-            checkpointer = AsyncPostgresSaver(checkpoint_pool)
+            checkpointer = AsyncPostgresSaver(checkpoint_pool, serde=serde)
             await checkpointer.setup()
             logger.info(
                 "agent: langgraph checkpointer ready schema=%s", schema

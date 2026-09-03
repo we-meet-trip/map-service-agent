@@ -33,6 +33,8 @@ def test_defaults() -> None:
     assert s.STATUS_STREAM_NAME == "agent:jobs:status"
     assert s.STATUS_STREAM_MAXLEN == 2000
     assert s.CHECKPOINT_ENABLED is True
+    assert s.CHECKPOINT_ENC_KEYS.get_secret_value() == ""
+    assert s.CHECKPOINT_ENC_ACTIVE_KID == ""
     assert s.LANGGRAPH_SCHEMA == "langgraph"
     assert s.JOB_TIMEOUT_SECONDS == 300.0
     assert s.SHUTDOWN_GRACE_SECONDS == 310.0

@@ -173,6 +173,12 @@ class AgentSettings(BaseSettings):
       POSTGRES_PASSWORD: 비밀값(SecretStr).
       LANGGRAPH_SCHEMA: 체크포인트 테이블이 거주할 schema 이름
                         (`langgraph`, agent 전용).
+      CHECKPOINT_ENC_KEYS: 체크포인트 봉인 열쇠 목록("kid:base64" 쉼표
+                        구분, 각 base64 는 32바이트). CHECKPOINT_ENABLED
+                        =true 면 필수 — 없으면 부팅 중단(평문 저장 폴백
+                        없음).
+      CHECKPOINT_ENC_ACTIVE_KID: 새로 봉할 때 쓰는 kid. 목록에 있어야
+                        한다. 나머지 열쇠는 옛 기록을 여는 데만 쓴다.
 
     잡 타이밍:
       JOB_TIMEOUT_SECONDS: 잡 1건의 전체 실행 한도. `_run_job` 의
@@ -279,6 +285,13 @@ class AgentSettings(BaseSettings):
     POSTGRES_USER: str = "map"
     POSTGRES_PASSWORD: SecretStr = SecretStr("")
     LANGGRAPH_SCHEMA: str = "langgraph"
+    # 체크포인트 봉인 열쇠. "kid:base64" 를 쉼표로 이어 여러 개를 두고
+    # ACTIVE_KID 의 열쇠로 새로 봉한다. 나머지는 옛 기록을 여는 데만 남는다
+    # (열쇠를 바꿔도 옛 기록을 계속 읽는다). 각 base64 는 32바이트로 풀려야
+    # 한다: openssl rand -base64 32. LOCATION_WIRE_KEY 와 같은 값이면 부팅
+    # 거부 — 한 열쇠가 새면 전송로와 저장소가 한꺼번에 열리기 때문이다.
+    CHECKPOINT_ENC_KEYS: SecretStr = SecretStr("")
+    CHECKPOINT_ENC_ACTIVE_KID: str = ""
 
     JOB_TIMEOUT_SECONDS: float = 300.0
     GEMINI_TIMEOUT_SECONDS: float = 100.0
