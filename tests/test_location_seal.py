@@ -83,3 +83,78 @@ def test_refuses_short_key():
 
     with pytest.raises(location_seal.SealError):
         location_seal.seal({"a": 1})
+
+
+def test_opened_places_become_schema_objects():
+    """봉투에서 꺼낸 장소는 스키마로 세워져야 한다.
+
+    검사 없이 dict 인 채로 넘기면 장소를 읽는 첫 노드가
+    "'dict' object has no attribute 'day'" 로 터진다 — 화면에는 사유 없는
+    502 로만 보이고, 좌표 범위 검사도 그때는 이미 지나간 뒤다.
+    """
+    from datetime import date, time
+
+    from app.main import _resolve_places
+    from app.schemas.agent_schemas import (
+        AgentRequest,
+        DateRange,
+        SelectedPlace,
+    )
+
+    req = AgentRequest(
+        date=DateRange(
+            date_start=date(2026, 7, 6),
+            date_end=date(2026, 7, 6),
+            time_start=time(9, 0),
+            time_end=time(18, 0),
+        ),
+        province="강원특별자치도",
+        city="속초시",
+        stage="route",
+        loc=location_seal.seal({
+            "places": [
+                {"name": "속초해변", "address": "강원 속초시",
+                 "lat": 38.19, "lng": 128.60, "day": 1},
+                {"name": "영금정", "address": "강원 속초시",
+                 "lat": 38.21, "lng": 128.60, "day": 1},
+            ]
+        }),
+    )
+
+    out = _resolve_places(req)
+
+    assert all(isinstance(p, SelectedPlace) for p in out.places)
+    assert out.places[0].day == 1
+    assert out.loc is None
+
+
+def test_opened_places_out_of_range_are_refused():
+    """봉투 안이라도 국내 밖 좌표는 받지 않는다."""
+    from datetime import date, time
+
+    from fastapi import HTTPException
+
+    from app.main import _resolve_places
+    from app.schemas.agent_schemas import AgentRequest, DateRange
+
+    req = AgentRequest(
+        date=DateRange(
+            date_start=date(2026, 7, 6),
+            date_end=date(2026, 7, 6),
+            time_start=time(9, 0),
+            time_end=time(18, 0),
+        ),
+        province="강원특별자치도",
+        city="속초시",
+        stage="route",
+        loc=location_seal.seal({
+            "places": [
+                {"name": "해외", "address": "", "lat": 10.0, "lng": 127.0,
+                 "day": 1},
+            ]
+        }),
+    )
+
+    with pytest.raises(HTTPException) as err:
+        _resolve_places(req)
+    assert err.value.status_code == 400

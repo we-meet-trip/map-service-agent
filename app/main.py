@@ -36,6 +36,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import ValidationError
 
 from app.agent_dependencies import (
     get_streams_publisher,
@@ -65,6 +66,7 @@ from app.schemas.agent_schemas import (
     ReviewsSummaryBatchResponse,
     ReviewsSummaryRequest,
     ReviewsSummaryResponse,
+    SelectedPlace,
     SummaryPlaceRequest,
 )
 
@@ -528,8 +530,17 @@ def _resolve_places(req: AgentRequest) -> AgentRequest:
     places = opened.get("places")
     if not isinstance(places, list):
         raise HTTPException(status_code=400, detail="invalid location")
-    logger.info("location seal opened path=/v1/recommend places=%d", len(places))
-    return req.model_copy(update={"places": places, "loc": None})
+    # 봉투를 연 값은 아직 검사를 거치지 않은 바깥 입력이다. 스키마로 세워
+    # 두지 않으면 dict 인 채로 그래프까지 흘러가 장소를 읽는 첫 노드에서
+    # 터진다 — 좌표 범위·글자 제한도 그때는 이미 지나간 뒤다.
+    try:
+        parsed = [SelectedPlace.model_validate(p) for p in places]
+    except ValidationError:
+        raise HTTPException(status_code=400, detail="invalid location")
+    logger.info(
+        "location seal opened path=/v1/recommend places=%d", len(parsed)
+    )
+    return req.model_copy(update={"places": parsed, "loc": None})
 
 
 @app.post(
