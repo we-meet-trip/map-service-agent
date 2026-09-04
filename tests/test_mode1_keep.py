@@ -7,6 +7,7 @@ from datetime import date, time
 import pytest
 from pydantic import ValidationError
 
+from app import agent_dependencies as deps
 from app.nodes.agent_nodes import (
     _merge_pinned,
     _pinned_places,
@@ -19,6 +20,8 @@ from app.schemas.agent_schemas import (
     DateRange,
     Mobility,
     Place,
+    PlaceSelection,
+    PlacesSelection,
     SelectedPlace,
 )
 
@@ -161,3 +164,61 @@ def test_contract_bounds_unchanged_for_upper_limit() -> None:
     """상한 10개는 그대로다."""
     with pytest.raises(ValidationError):
         _request(stage="mode1", places=[_selected("A", "c1")] * 11)
+
+
+class _FakeGemini:
+    """정해 둔 응답 하나만 돌려주는 대역."""
+
+    def __init__(self, result) -> None:
+        self._result = result
+        self.calls = 0
+
+    async def generate_structured(
+        self, prompt, schema, *, system_instruction=None
+    ):
+        self.calls += 1
+        return self._result
+
+
+def _candidate(idx: int) -> dict:
+    return {
+        "content_id": f"kakao:{idx}",
+        "source": "kakao",
+        "name": f"새장소{idx}",
+        "address": "서울 강남구",
+        "lat": 37.5,
+        "lng": 127.0,
+        "category": "음식점 / 카페",
+    }
+
+
+def test_recommend_places_merges_pins_with_selection() -> None:
+    """남길 장소와 새로 뽑은 장소가 하나의 일정으로 합쳐진다.
+
+    번호는 0..N-1 로 다시 매겨져야 한다 — 동선 노드가 이 번호로 장소를
+    지목하므로 빈 번호나 중복이 있으면 그 검증에 걸린다.
+    """
+    req = _request(stage="mode1", places=[_selected("남길곳", "kakao:1")])
+    state = _state(req, targets=[3])
+    state["candidates"] = [_candidate(7), _candidate(8)]
+    state["grounded"] = True
+
+    selection = PlacesSelection(
+        selections=[
+            PlaceSelection(index=0, day=1, recommended_visit_time="오전"),
+            PlaceSelection(index=1, day=1, recommended_visit_time="오후"),
+        ]
+    )
+    gemini = _FakeGemini(selection)
+    deps.set_gemini_client(gemini)
+    try:
+        out = asyncio.run(recommend_places(state))
+    finally:
+        deps.reset_all()
+
+    places = out["places"]
+    assert gemini.calls == 1
+    assert [p.name for p in places] == ["남길곳", "새장소7", "새장소8"]
+    assert [p.place_id for p in places] == [0, 1, 2]
+    # 남길 장소 하나를 뺀 두 자리만 뽑도록 계획이 줄어 있어야 한다.
+    assert state["plan"]["days"][0]["target_stops"] == 2
