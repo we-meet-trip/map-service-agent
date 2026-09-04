@@ -47,6 +47,7 @@ from app.schemas.agent_schemas import (
     Place,
     PlacesSelection,
     ReasonEnvelope,
+    SelectedPlace,
 )
 
 logger = logging.getLogger(__name__)
@@ -527,10 +528,13 @@ async def parse_input(state: AgentState) -> AgentState:
       - 구간 > _MAX_RANGE_DAYS(14일) → "date range must be <= 14 days"
       - time_start >= time_end       → "time_start must be < time_end"
       - stage="route" 인데 places 없음 → "stage=route requires places"
+      - stage="route" 인데 places 1개 → "stage=route requires at least 2 places"
 
     stage="route" 는 사용자가 고른 장소로 동선만 짜는 경로다. 장소 목록이
-    요청의 전부이므로 없으면 아무것도 할 수 없다(개수 범위는 스키마가
-    이미 강제하므로 여기서는 존재 여부만 본다).
+    요청의 전부이므로 없으면 아무것도 할 수 없고, 한 곳뿐이면 이을 구간이
+    없다. 개수 하한을 여기서 보는 이유는 스키마 하한이 1이기 때문이다 —
+    재탐색은 한 곳만 남기는 요청이 정상이라 하한을 낮췄고, 그 대신 2개가
+    필요한 쪽을 이 자리에서 지킨다.
 
     어떤 검사라도 실패하면 `state["error"]` 를 설정하고 즉시 반환한다.
     상태는 그대로 다음 노드로 흘러가지만, 후속 노드들은 본 키를 보고 no-op.
@@ -549,9 +553,13 @@ async def parse_input(state: AgentState) -> AgentState:
     if d.time_start >= d.time_end:
         state["error"] = "time_start must be < time_end"
         return state
-    if req.stage == "route" and not req.places:
-        state["error"] = "stage=route requires places"
-        return state
+    if req.stage == "route":
+        if not req.places:
+            state["error"] = "stage=route requires places"
+            return state
+        if len(req.places) < 2:
+            state["error"] = "stage=route requires at least 2 places"
+            return state
     return state
 
 
@@ -585,9 +593,22 @@ async def load_given_places(state: AgentState) -> AgentState:
     if not selected:
         state["error"] = "stage=route requires places"
         return state
-    num_days = _num_days(req)
+    state["places"] = _places_from_selected(selected, _num_days(req))
+    state["grounded"] = True
+    return state
+
+
+def _places_from_selected(
+    selected: list[SelectedPlace], num_days: int
+) -> list[Place]:
+    """사용자가 지목한 장소를 `Place` 로 옮긴다 — 일차 오름차순, 번호 0..N-1.
+
+    번호와 일차 순서가 어긋나면 동선 검증에 걸리므로 정렬을 먼저 한다.
+    분류는 새로 알아낼 길이 없어 호출 측이 되돌려 준 값을 그대로 싣는다.
+    좌표·문자 검증은 요청 스키마가 이미 마쳤다.
+    """
     ordered = sorted(selected, key=lambda p: min(p.day, num_days))
-    state["places"] = [
+    return [
         Place(
             place_id=i,
             day=min(p.day, num_days),
@@ -597,15 +618,11 @@ async def load_given_places(state: AgentState) -> AgentState:
             lng=p.lng,
             recommended_visit_time="",
             content_id=p.content_id,
-            # 이 단계는 장소를 새로 찾지 않아 분류를 알아낼 길이 없다.
-            # 호출 측이 처음 받았던 값을 되돌려 주므로 그대로 싣는다.
             category=p.category,
             grounded=True,
         )
         for i, p in enumerate(ordered)
     ]
-    state["grounded"] = True
-    return state
 
 
 async def fetch_weather(state: AgentState) -> AgentState:
@@ -1242,17 +1259,89 @@ async def recommend_places(state: AgentState) -> AgentState:
       선정 프롬프트에 싣기 직전에 후보 수를 상한까지 줄인다. 앞 노드들이
       실패로 통과했을 때도 반드시 걸리도록 이 한 곳에서만 자른다.
 
+    재탐색에서 남길 장소:
+      stage="mode1" 에 places 가 실려 오면 "이건 그대로 두라"는 뜻이다.
+      그 장소들을 먼저 세우고 그날 뽑을 수를 그만큼 줄인 다음, 남은 자리만
+      평소 경로로 채워 하나로 합친다. 남길 것이 그날 몫을 이미 채웠으면
+      모델을 부르지 않는다 — 부를 이유가 없다.
+
     호출처: LangGraph(score_and_rank 다음).
     """
     await _emit_stage(state, "recommend_places")
     if state.get("error"):
         return state
+    pinned = _pinned_places(state)
+    if pinned and not _remaining_targets(state, pinned):
+        # 남길 장소가 그날 몫을 전부 채웠다. 더 뽑을 자리가 없다.
+        state["places"] = pinned
+        return state
     candidates = state.get("candidates") or []
     if candidates:
         candidates = _cap_candidates(candidates, _candidate_limit(state))
         state["candidates"] = candidates
-        return await _select_places(state, candidates)
-    return await _invent_places(state)
+        state = await _select_places(state, candidates)
+    else:
+        state = await _invent_places(state)
+    if pinned and not state.get("error"):
+        state["places"] = _merge_pinned(pinned, state.get("places") or [])
+    return state
+
+
+def _pinned_places(state: AgentState) -> list[Place]:
+    """재탐색 요청에 실려 온 "남길 장소"를 `Place` 로 세운다.
+
+    stage 가 mode1 이 아니거나 목록이 비어 있으면 빈 목록이다 — 그 경우
+    재탐색은 예전처럼 전부 다시 뽑는다.
+    """
+    req = state["request"]
+    if req.stage != "mode1" or not req.places:
+        return []
+    return _places_from_selected(req.places, _num_days(req))
+
+
+def _remaining_targets(state: AgentState, pinned: list[Place]) -> bool:
+    """남길 장소를 뺀 뒤에도 더 뽑을 자리가 있는지 보고, plan 을 그만큼 줄인다.
+
+    선정 프롬프트는 plan 의 target_stops 를 그날 뽑을 수로 읽는다. 남길
+    장소를 세어 두지 않으면 그 수만큼 더 뽑아 일정이 부푼다.
+
+    plan 이 없으면(전략 노드가 실패로 지나갔으면) 줄일 것도 없으므로 자리가
+    남아 있다고 본다 — 뽑기를 건너뛰어 일정을 남길 장소만으로 만들면 그쪽이
+    더 큰 손해다.
+    """
+    days = (state.get("plan") or {}).get("days")
+    if not days:
+        return True
+    pinned_per_day: dict[int, int] = {}
+    for p in pinned:
+        pinned_per_day[p.day] = pinned_per_day.get(p.day, 0) + 1
+    remaining = 0
+    for entry in days:
+        target = entry.get("target_stops") or 0
+        left = max(0, target - pinned_per_day.get(entry.get("day"), 0))
+        entry["target_stops"] = left
+        remaining += left
+    return remaining > 0
+
+
+def _merge_pinned(pinned: list[Place], fresh: list[Place]) -> list[Place]:
+    """남길 장소와 새로 뽑은 장소를 하나의 일정으로 합친다.
+
+    같은 곳이 두 번 들어가지 않게 content_id 로 거른다. 새로 뽑은 쪽에
+    남길 장소가 섞여 있을 수 있는데, 제외 목록이 닿지 않는 창작 폴백에서
+    특히 그렇다.
+
+    일차 오름차순으로 정렬하고 번호를 0..N-1 로 다시 매긴다 — 번호가 곧
+    동선 노드가 장소를 지목하는 키이고, 일차와 어긋나면 검증에 걸린다.
+    같은 일차 안에서는 남길 장소를 앞에 둔다.
+    """
+    pinned_ids = {p.content_id for p in pinned if p.content_id}
+    merged = list(pinned) + [
+        p for p in fresh
+        if not (p.content_id and p.content_id in pinned_ids)
+    ]
+    merged.sort(key=lambda p: p.day)
+    return [p.model_copy(update={"place_id": i}) for i, p in enumerate(merged)]
 
 
 def _candidate_limit(state: AgentState) -> int:
