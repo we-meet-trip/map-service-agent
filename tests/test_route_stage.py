@@ -154,16 +154,23 @@ def _invoke(req, hub, gemini):
 # ── 요청 스키마 ────────────────────────────────────────────────
 
 def test_places_require_two_to_ten() -> None:
-    """장소가 1개면 이을 구간이 없고, 11개는 상한을 넘는다."""
-    with pytest.raises(ValidationError):
-        AgentRequest(
-            date=DateRange(
-                date_start=date(2026, 7, 6), date_end=date(2026, 7, 6),
-                time_start=time(9, 0), time_end=time(18, 0),
-            ),
-            province="서울특별시", city="강남구",
-            stage="route", places=_selected(1),
-        )
+    """장소 1개는 동선을 이을 수 없고, 11개는 상한을 넘는다.
+
+    1개 하한은 스키마가 아니라 parse_input 이 지킨다 — 재탐색은 한 곳만
+    남기는 요청이 정상이라 스키마 하한을 1로 내렸기 때문이다
+    (tests/test_mode1_keep.py 참조).
+    """
+    one = AgentRequest(
+        date=DateRange(
+            date_start=date(2026, 7, 6), date_end=date(2026, 7, 6),
+            time_start=time(9, 0), time_end=time(18, 0),
+        ),
+        province="서울특별시", city="강남구",
+        stage="route", places=_selected(1),
+    )
+    out = asyncio.run(parse_input({"job_id": "j", "request": one}))
+    assert out["error"] == "stage=route requires at least 2 places"
+
     with pytest.raises(ValidationError):
         AgentRequest(
             date=DateRange(
