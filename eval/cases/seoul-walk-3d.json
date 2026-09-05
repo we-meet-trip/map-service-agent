@@ -1,0 +1,16 @@
+{
+  "id": "seoul-walk-3d",
+  "note": "도보 사흘. 날마다 반경이 따로 적용된다.",
+  "request": {
+    "province": "서울특별시",
+    "city": "종로구",
+    "days": 3,
+    "mobility": "walk"
+  },
+  "expect": {
+    "max_radius_km": 3.0,
+    "time_start": "09:00",
+    "time_end": "21:00",
+    "grounded": true
+  }
+}

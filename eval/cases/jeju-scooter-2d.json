@@ -1,0 +1,16 @@
+{
+  "id": "jeju-scooter-2d",
+  "note": "킥보드 이틀. 자전거와 같은 10km 를 쓴다.",
+  "request": {
+    "province": "제주특별자치도",
+    "city": "제주시",
+    "days": 2,
+    "mobility": "scooter"
+  },
+  "expect": {
+    "max_radius_km": 10.0,
+    "time_start": "10:00",
+    "time_end": "18:00",
+    "grounded": true
+  }
+}

@@ -29,7 +29,8 @@ class _FlakyGemini:
         self.error = error
         self.prompts: list[str] = []
 
-    async def generate_structured(self, prompt, schema, *, system_instruction=None):
+    async def generate_structured(self, prompt, schema, *, system_instruction=None,
+                                  usage_sink=None):
         self.prompts.append(prompt)
         if len(self.prompts) <= self.fail_times:
             if self.error is not None:
@@ -127,7 +128,7 @@ class _TruncatedGemini:
         self.prompts: list[str] = []
 
     async def generate_structured(
-        self, prompt, schema, *, system_instruction=None
+        self, prompt, schema, *, system_instruction=None, usage_sink=None
     ):
         self.prompts.append(prompt)
         raise StructuredOutputError(

@@ -101,7 +101,8 @@ class _SeqGemini:
         self._results = list(results)
         self.calls = 0
 
-    async def generate_structured(self, prompt, schema, *, system_instruction=None):
+    async def generate_structured(self, prompt, schema, *, system_instruction=None,
+                                  usage_sink=None):
         self.calls += 1
         item = self._results.pop(0)
         if isinstance(item, Exception):
@@ -113,7 +114,7 @@ class _CapturePublisher:
     def __init__(self) -> None:
         self.payloads: list[dict] = []
 
-    async def publish(self, job_id, status, payload_json):
+    async def publish(self, job_id, status, payload_json, training_json=None):
         self.payloads.append(json.loads(payload_json))
         return "1-0"
 

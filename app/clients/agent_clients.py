@@ -302,6 +302,12 @@ class HubClient:
         await self._client.aclose()
 
 
+# 학습 신호 필드의 크기 상한(바이트). 후보 수십 개와 점수를 담아도 이 아래에
+# 들어오지만, 프롬프트 상한이 바뀌어 예상보다 커질 수 있다. Redis 는 메모리에
+# 들고 있으므로 한 건이 커지면 stream 전체가 함께 부푼다.
+TRAINING_FIELD_MAX_BYTES = 256 * 1024
+
+
 class StreamsPublisher:
     """Redis Streams XADD 발행자.
 
@@ -345,7 +351,11 @@ class StreamsPublisher:
             return False
 
     async def publish(
-        self, job_id: str, status: str, payload_json: str
+        self,
+        job_id: str,
+        status: str,
+        payload_json: str,
+        training_json: str | None = None,
     ) -> str:
         """잡 1건의 결과를 stream 에 발행하고 메시지 id 를 돌려준다.
 
@@ -353,10 +363,19 @@ class StreamsPublisher:
           job_id: 잡 식별자. 메시지의 "job_id" 필드.
           status: "done" 또는 "failed". 메시지의 "status" 필드.
           payload_json: `JobDonePayload.model_dump_json(by_alias=True)` 결과.
+          training_json: 학습 신호(후보·점수·경로). 없으면 필드를 만들지 않는다.
+
+        학습 신호를 payload 에 섞지 않고 필드를 따로 두는 이유:
+          payload 는 BFF 가 초안으로 저장해 클라이언트 응답 본문으로 그대로
+          내보낸다. 후보 수십 개를 거기에 넣으면 모바일이 매번 그만큼을 더
+          받는다. 소비자는 필요한 키만 꺼내 읽으므로 필드가 늘어도 기존
+          소비자는 영향을 받지 않는다.
 
         동작:
           - `maxlen > 0` 이면 `maxlen=...`, `approximate=True` 인자를
             xadd 에 전달해 길이를 본 값 근처로 유지한다.
+          - 학습 신호가 상한을 넘으면 싣지 않는다. 한 건 때문에 stream 이
+            부풀어 정작 필요한 결과 전달이 밀리는 편이 더 나쁘다.
           - 성공 시 부여된 message id 를 그대로 반환.
 
         호출처:
@@ -376,18 +395,28 @@ class StreamsPublisher:
             if location_seal.enabled()
             else payload_json
         )
+        fields: dict[str, str] = {
+            "job_id": job_id,
+            "status": status,
+            "payload": body,
+        }
+        dropped = False
+        if training_json:
+            if len(training_json.encode("utf-8")) <= TRAINING_FIELD_MAX_BYTES:
+                fields["training"] = training_json
+            else:
+                dropped = True
         message_id = await self._client.xadd(
-            self._stream,
-            {
-                "job_id": job_id,
-                "status": status,
-                "payload": body,
-            },
-            **xadd_kwargs,
+            self._stream, fields, **xadd_kwargs,
         )
+        if dropped:
+            logger.warning(
+                "training signal dropped (over %d bytes) job_id=%s",
+                TRAINING_FIELD_MAX_BYTES, job_id,
+            )
         logger.info(
-            "stream xadd id=%s job_id=%s status=%s",
-            message_id, job_id, status,
+            "stream xadd id=%s job_id=%s status=%s training=%s",
+            message_id, job_id, status, "training" in fields,
         )
         return message_id
 
@@ -426,6 +455,25 @@ class StreamsPublisher:
         호출처: `app/main.py` lifespan 종료 finally 블록.
         """
         await self._client.aclose()
+
+
+def _record_usage(resp, sink: list[dict] | None) -> None:
+    """응답에 실린 토큰 수를 목록에 덧붙인다. 없으면 아무 것도 하지 않는다.
+
+    SDK 판이나 모델에 따라 이 값이 비어 올 수 있어, 없다고 해서 호출을
+    실패로 보지 않는다 — 계량이 본 기능을 막아서는 안 된다.
+    """
+    if sink is None:
+        return
+    meta = getattr(resp, "usage_metadata", None)
+    if meta is None:
+        return
+    prompt = getattr(meta, "prompt_token_count", None)
+    output = getattr(meta, "candidates_token_count", None)
+    total = getattr(meta, "total_token_count", None)
+    if prompt is None and output is None and total is None:
+        return
+    sink.append({"prompt": prompt, "output": output, "total": total})
 
 
 class GeminiClient:
@@ -550,8 +598,15 @@ class GeminiClient:
         response_schema: Type[T],
         *,
         system_instruction: str | None = None,
+        usage_sink: list[dict] | None = None,
     ) -> T:
         """구조화(JSON) 응답을 Pydantic 모델로 검증해서 돌려준다.
+
+        usage_sink: 주면 이번 호출이 쓴 토큰 수를 여기에 덧붙인다.
+                    호출자가 자기 목록을 넘기므로 동시 호출이 섞이지 않는다
+                    (클라이언트에 마지막 값을 들고 있으면 섞인다).
+                    자체 모델로 옮길 때 필요한 컴퓨트를 이 값으로 가늠한다 —
+                    지금은 이 수치가 어디에도 남지 않아 짐작밖에 할 수 없다.
 
         prompt: 입력 프롬프트(데이터 태그로 격리된 user 콘텐츠).
         response_schema: 응답 스키마로 사용할 Pydantic 모델 클래스(예:
@@ -610,6 +665,7 @@ class GeminiClient:
             ),
             timeout=self._timeout,
         )
+        _record_usage(resp, usage_sink)
         body = resp.text or ""
         try:
             return response_schema.model_validate_json(body)

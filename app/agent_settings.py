@@ -260,6 +260,10 @@ class AgentSettings(BaseSettings):
     # RULES_ENABLED=false 일 때도 함께 꺼진다.
     PERSONALIZATION_ENABLED: bool = True
 
+    # 세어 둔 성향별 저장 비율을 랭킹에 얹을지. 파일 경로가 비어 있거나
+    # 파일이 없으면 켜져 있어도 아무 일도 하지 않는다.
+    SEGMENT_STATS_PATH: str = ""
+
     RULES_ENABLED: bool = True  # kill-switch — 장애 시 no-op 복귀
 
     # 시간축(체류시간·방문 시각) 산출 스위치. False 면 build_timeline 과

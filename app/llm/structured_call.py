@@ -86,6 +86,10 @@ async def call_structured(
       - StructuredOutputError: 교정 재시도까지 실패(또는 재시도 예산 없음).
       - 그 외(타임아웃/GeminiQuotaError 등): 재시도 없이 그대로 전파.
 
+    토큰 사용량은 state["llm_usage"] 에 쌓인다. 자체 모델로 옮길 때 필요한
+    컴퓨트를 이 값으로 가늠하는데, 지금은 어디에도 남지 않아 짐작밖에 할 수
+    없다. 재시도분도 함께 센다 — 실제로 쓴 양이 그것이기 때문이다.
+
     호출처: app/nodes/agent_nodes.py 의 LLM 노드들.
     """
     from app.agent_dependencies import get_gemini_client
@@ -93,9 +97,26 @@ async def call_structured(
     gemini = get_gemini_client()
 
     _consume_budget(state, max_calls)
+    # 이번 호출이 쓴 토큰을 담을 자리. 호출마다 새로 만들어 넘기므로 동시에
+    # 도는 다른 잡의 수치와 섞이지 않는다.
+    usage: list[dict] = []
+    try:
+        return await _call(gemini, state, usage, prompt, response_schema,
+                           system_instruction, max_calls)
+    finally:
+        # 성공이든 실패든 쓴 만큼은 센다. 실패한 호출도 토큰을 쓰므로,
+        # 성공분만 세면 실제 소비량을 낮춰 보게 된다.
+        if usage:
+            state["llm_usage"] = (state.get("llm_usage") or []) + usage
+
+
+async def _call(gemini, state, usage, prompt, response_schema,
+                system_instruction, max_calls):
+    """실제 호출과 교정 재시도. 토큰 계량은 바깥 finally 가 맡는다."""
     try:
         return await gemini.generate_structured(
-            prompt, response_schema, system_instruction=system_instruction
+            prompt, response_schema, system_instruction=system_instruction,
+            usage_sink=usage,
         )
     except StructuredOutputError as e:
         logger.warning(
@@ -124,5 +145,6 @@ async def call_structured(
             "</error_feedback>\n"
         )
         return await gemini.generate_structured(
-            corrective, response_schema, system_instruction=system_instruction
+            corrective, response_schema, system_instruction=system_instruction,
+            usage_sink=usage,
         )

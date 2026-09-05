@@ -80,7 +80,7 @@ class _SelectGemini:
         self._selection = selection
 
     async def generate_structured(
-        self, prompt, schema, *, system_instruction=None
+        self, prompt, schema, *, system_instruction=None, usage_sink=None
     ):
         return self._selection
 

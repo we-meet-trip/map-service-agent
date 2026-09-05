@@ -101,7 +101,7 @@ class _SpyGemini:
         self.prompts: list[str] = []
 
     async def generate_structured(
-        self, prompt, response_schema, *, system_instruction=None
+        self, prompt, response_schema, *, system_instruction=None, usage_sink=None
     ):
         self.prompts.append(prompt)
         return self.envelope

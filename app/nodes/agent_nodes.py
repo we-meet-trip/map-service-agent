@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from datetime import date, timedelta
@@ -286,6 +287,61 @@ _AFFINITY_MAX = 0.10
 _AFFINITY_DECAY = 0.7
 
 
+# 세어 둔 성향별 저장 비율. 처음 쓸 때 한 번 읽고 들고 있는다.
+#
+# 매번 읽지 않는 이유: 요청마다 파일을 열면 그만큼 느려지고, 도는 중에 파일이
+# 바뀌면 같은 요청이 앞뒤로 다른 점수를 받는다. 바뀐 통계는 다시 띄울 때 든다.
+_SEGMENT_STATS: dict | None = None
+_SEGMENT_STATS_LOADED = False
+
+
+def _segment_stats() -> dict:
+    """세어 둔 통계를 돌려준다. 없으면 빈 것."""
+    global _SEGMENT_STATS, _SEGMENT_STATS_LOADED
+    if _SEGMENT_STATS_LOADED:
+        return _SEGMENT_STATS or {}
+    _SEGMENT_STATS_LOADED = True
+    path = get_settings().SEGMENT_STATS_PATH
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            _SEGMENT_STATS = json.load(f)
+        segments = (_SEGMENT_STATS or {}).get("segments") or {}
+        logger.info("segment stats loaded segments=%d path=%s", len(segments), path)
+    except (OSError, ValueError) as e:
+        # 통계를 못 읽는 것이 추천을 막아서는 안 된다. 없는 것으로 친다.
+        logger.warning("segment stats load failed path=%s reason=%s",
+                       path, type(e).__name__)
+        _SEGMENT_STATS = None
+    return _SEGMENT_STATS or {}
+
+
+def _segment_gain(candidate: dict, segment: dict | None) -> float:
+    """이 사람 묶음이 이 곳을 남긴 비율만큼의 가점(0 ~ _AFFINITY_MAX).
+
+    문턱을 못 넘어 통계에 없는 곳은 0 이다. 한두 번의 우연을 취향으로 굳히지
+    않으려는 것이고, 그 판정은 통계를 만드는 쪽에서 이미 끝났다.
+    """
+    if not segment:
+        return 0.0
+    cid = candidate.get("content_id")
+    if not cid:
+        return 0.0
+    entry = (segment.get("places") or {}).get(cid)
+    if not entry:
+        return 0.0
+    return _AFFINITY_MAX * float(entry.get("rate") or 0.0)
+
+
+def _segment_for(age_band: str | None, gender: str | None) -> dict | None:
+    """요청자의 성향 묶음에 해당하는 통계 칸. 없으면 None."""
+    stats = _segment_stats()
+    segments = stats.get("segments") or {}
+    key = f"{age_band or 'unknown'}|{gender or 'unknown'}"
+    return segments.get(key)
+
+
 def _affinity(candidate: dict, themes: list[str] | None) -> float:
     """후보 한 건의 테마 친화 가점(0 ~ _AFFINITY_MAX).
 
@@ -492,6 +548,10 @@ class AgentState(TypedDict):
     visit_order: NotRequired[list[int]]
     legs: NotRequired[list[Leg]]
     llm_calls_used: NotRequired[int]
+    # 이번 요청이 실제로 쓴 토큰 수. 호출마다 한 항목씩 쌓인다.
+    # 자체 모델로 옮길 때 필요한 컴퓨트를 이 값으로 가늠한다 — 호출 횟수만으로는
+    # 알 수 없다. 후보를 수십 개 싣는 요청과 이유만 쓰는 요청이 크게 다르다.
+    llm_usage: NotRequired[list[dict]]
     reasons: NotRequired[dict[int, str]]
     clothing: NotRequired[str]
     summaries: NotRequired[dict[int, list[str]]]
@@ -501,6 +561,15 @@ class AgentState(TypedDict):
     timeline_overflow_days: NotRequired[list[int]]
     warnings: NotRequired[list[str]]
     degraded_reason: NotRequired[str]
+    # 이번 결과를 어느 경로가 만들었는지: select / invent /
+    # select_then_invent / route. publish_done 이 학습 신호에 함께 실어
+    # 보낸다.
+    #
+    # degraded_reason 으로 대신할 수 없어 채널을 따로 둔다. 그 값은 하나뿐이라
+    # llm_reason 단계가 자기 사유로 덮어쓰고, 그러면 종착 노드에 닿았을 때는
+    # 선정이 창작으로 넘어갔다는 사실이 이미 지워져 있다. 후보 목록을 남겨도
+    # 그것을 실제로 쓴 경로를 모르면 목록의 의미가 정해지지 않는다.
+    selection_path: NotRequired[str]
     error: NotRequired[str]
 
 
@@ -593,6 +662,9 @@ async def load_given_places(state: AgentState) -> AgentState:
     if not selected:
         state["error"] = "stage=route requires places"
         return state
+    # 사용자가 직접 고른 경로다. 후보 목록도 랭킹도 거치지 않으므로 학습에서
+    # 다른 경로와 같이 묶으면 안 된다.
+    state["selection_path"] = "route"
     state["places"] = _places_from_selected(selected, _num_days(req))
     state["grounded"] = True
     return state
@@ -1195,12 +1267,22 @@ async def score_and_rank(state: AgentState) -> AgentState:
         if settings.PERSONALIZATION_ENABLED
         else None
     )
+    # 요청에는 성향이 실리지 않는다(B2 계약을 바꾸지 않기로 했다). 지금은
+    # 묶음을 모르므로 "모름" 칸을 본다 — 자료가 쌓이면 그 칸에도 값이 생긴다.
+    segment = (
+        _segment_for(None, None)
+        if settings.PERSONALIZATION_ENABLED
+        else None
+    )
     pois = [
         {
             "content_id": c["content_id"],
             "indoor_flag": c.get("category_group_code")
             in _INDOOR_CATEGORY_GROUPS,
-            "base_score": 1.0 - 0.01 * i + _affinity(c, themes),
+            # 취향 가점과 세어 둔 가점 중 큰 것만 쓴다. 합하면 상한(0.10)을
+            # 넘어 "날씨가 취향을 이긴다"(실내 가점 0.15) 는 규약이 깨진다.
+            "base_score": 1.0 - 0.01 * i
+            + max(_affinity(c, themes), _segment_gain(c, segment)),
         }
         for i, c in enumerate(candidates)
         if isinstance(c, dict) and c.get("content_id")
@@ -1279,8 +1361,10 @@ async def recommend_places(state: AgentState) -> AgentState:
     if candidates:
         candidates = _cap_candidates(candidates, _candidate_limit(state))
         state["candidates"] = candidates
+        state["selection_path"] = "select"
         state = await _select_places(state, candidates)
     else:
+        state["selection_path"] = "invent"
         state = await _invent_places(state)
     if pinned and not state.get("error"):
         state["places"] = _merge_pinned(pinned, state.get("places") or [])
@@ -1628,6 +1712,8 @@ async def _select_places(
                 state.get("job_id"),
             )
             state["degraded_reason"] = "select_empty_fallback_to_invent"
+            # degraded_reason 은 뒤 단계가 자기 사유로 덮으므로 경로는 따로 남긴다.
+            state["selection_path"] = "select_then_invent"
             return await _invent_places(state)
         state["error"] = "recommend_places returned empty"
         return state
@@ -2317,6 +2403,115 @@ async def build_payload(state: AgentState) -> AgentState:
     return state
 
 
+# 학습 신호 계약의 판. 소비하는 쪽이 형태를 보고 갈라 읽을 수 있게 함께 싣는다.
+#
+# 2: 요청 조건(request)·랭킹 설정(ranking_config)·후보의 분류 코드를 더했다.
+#    앞의 둘이 없으면 "무엇을 물었을 때 무엇이 뽑혔는가" 가 성립하지 않고,
+#    코드가 없으면 그 잡의 랭킹을 나중에 다시 돌려볼 수 없다.
+TRAINING_SCHEMA_VERSION = 2
+
+
+def _training_signal(state: AgentState) -> str | None:
+    """이번 잡이 남길 학습 신호를 JSON 문자열로 만든다. 없으면 None.
+
+    무엇을 담는가:
+      selection_path  이 결과를 만든 경로. 이것 없이는 후보 목록의 의미가
+                      정해지지 않는다 — 목록이 있어도 창작 경로로 넘어갔다면
+                      "고르지 않은 후보" 가 아니다.
+      candidates      프롬프트에 실제로 실린 후보. 노출 순위를 함께 남긴다.
+                      순위를 남기는 이유는, 나중에 "고르지 않은 것" 을 그대로
+                      부정 표본으로 쓰면 위에 있던 것이 뽑히기 쉬웠던 효과가
+                      선호로 둔갑하기 때문이다. 보정하려면 순위가 필요하다.
+      scores_pre_cap  룰 엔진이 매긴 점수. 이름에 pre_cap 을 박아 둔 이유는
+                      이 값이 후보를 자르기 전 집합을 기준으로 만들어져
+                      candidates 와 개수가 다르기 때문이다. 사람의 선호가
+                      아니라 기존 룰의 산출값이므로 학습의 정답으로 쓰면
+                      룰을 베끼는 것에 그친다. 진단용으로만 둔다.
+      grounded        실측 후보를 썼는지.
+      request         이번 요청의 조건(기간·시간대·예산·테마·이동수단·지역).
+                      학습의 입력이 되는 값이다. 이것이 없으면 후보와 선택만
+                      남아 "무엇을 물었길래 이렇게 뽑혔는가" 를 되짚을 수 없다.
+                      프롬프트에 싣는 것과 같은 새니타이즈를 거친 뷰를 쓴다.
+      ranking_config  이 잡이 어떤 랭킹 설정에서 나왔는지. 개인화나 룰을 켜고
+                      끄면 같은 조건에서도 다른 결과가 나오는데, 그 사실이
+                      남지 않으면 설정이 바뀐 앞뒤 데이터가 한 덩어리로 섞인다.
+                      나중에 추가할 수 없는 값이라 처음부터 함께 남긴다.
+
+    실패한 잡은 남기지 않는다. 무엇을 보고 무엇을 골랐는지가 없다.
+
+    모든 접근은 get 으로 한다. route 나 저하 경로에서는 후보·점수 키가 아예
+    없으며, 여기서 KeyError 가 나면 결과 발행 자체가 막힌다.
+    """
+    if state.get("error"):
+        return None
+    path = state.get("selection_path")
+    if not path:
+        return None
+
+    settings = get_settings()
+    candidates = state.get("candidates") or []
+    signal: dict = {
+        "schema_version": TRAINING_SCHEMA_VERSION,
+        "path": path,
+        "grounded": bool(state.get("grounded")),
+        "model": settings.GEMINI_MODEL,
+        "candidate_count": len(candidates),
+        "candidates": [
+            {
+                "rank": i,
+                "content_id": c.get("content_id"),
+                "name": c.get("name"),
+                "category": c.get("category"),
+                # 랭킹이 실제로 보는 키다. 표시용 category 문자열만 남기면
+                # 나중에 같은 랭킹을 다시 돌려도 다른 결과가 나온다.
+                "category_group_code": c.get("category_group_code"),
+                "lat": c.get("lat"),
+                "lng": c.get("lng"),
+            }
+            for i, c in enumerate(candidates)
+            if isinstance(c, dict)
+        ],
+        "chosen_content_ids": [
+            p.content_id for p in (state.get("places") or [])
+            if getattr(p, "content_id", None)
+        ],
+    }
+    # 요청은 AgentRequest 일 때만 싣는다. 이 함수는 요청이 없는 상태(저하
+    # 경로·시험)로도 불리므로, 있다고 단정하면 그 자리에서 결과 발행이 막힌다.
+    req = state.get("request")
+    if isinstance(req, AgentRequest):
+        signal["request"] = _safe_request_view(req)
+
+    # 켜고 끄는 스위치의 그때 상태. 값이 아니라 상태를 남긴다.
+    signal["ranking_config"] = {
+        "personalization_enabled": bool(settings.PERSONALIZATION_ENABLED),
+        "rules_enabled": bool(settings.RULES_ENABLED),
+    }
+
+    scores = state.get("scores")
+    if scores:
+        signal["scores_pre_cap"] = scores
+
+    usage = state.get("llm_usage") or []
+    if usage:
+        # 호출별로도 남기고 합계도 함께 둔다. 합계만 두면 어느 단계가 큰지
+        # 알 수 없고, 호출별만 두면 읽는 쪽이 매번 더해야 한다.
+        signal["llm_usage"] = usage
+        signal["llm_tokens"] = {
+            "calls": len(usage),
+            "prompt": sum(u.get("prompt") or 0 for u in usage),
+            "output": sum(u.get("output") or 0 for u in usage),
+            "total": sum(u.get("total") or 0 for u in usage),
+        }
+    try:
+        return json.dumps(signal, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as e:
+        # 신호를 못 만드는 것이 결과 발행을 막아서는 안 된다.
+        logger.warning("training signal build failed job_id=%s reason=%s",
+                       state.get("job_id"), type(e).__name__)
+        return None
+
+
 async def publish_done(state: AgentState) -> AgentState:
     """결과 페이로드를 Redis Streams 에 발행하는 종착 노드.
 
@@ -2361,5 +2556,6 @@ async def publish_done(state: AgentState) -> AgentState:
         job_id=job_id,
         status=payload.status,
         payload_json=payload.model_dump_json(by_alias=True),
+        training_json=_training_signal(state),
     )
     return state
