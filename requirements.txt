@@ -3,13 +3,15 @@
 
 # fastapi
 #   - app/main.py 에서 `FastAPI(...)` 인스턴스, `@app.get("/health")`, `@app.post("/v1/recommend")` 라우터 정의에 사용.
-fastapi==0.136.1
+fastapi==0.141.1
+# Explicit security pin: excludes CVE-2026-48818 / CVE-2026-54283.
+starlette==1.6.0
 # uvicorn[standard]
 #   - Dockerfile ENTRYPOINT 의 ASGI 서버. app.main:app 을 호스팅한다.
 uvicorn[standard]==0.47.0
 # prometheus-fastapi-instrumentator
 #   - app/main.py 에서 GET /metrics 노출. 모니터링 스택이 스크레이프.
-prometheus-fastapi-instrumentator>=7.0,<8.0
+prometheus-fastapi-instrumentator==8.1.0
 # httpx[http2]
 #   - app/clients/agent_clients.py HubClient 가 `httpx.AsyncClient` 로 hub /v1/weather 를 호출.
 #   - app/nodes/agent_nodes.py fetch_weather 가 `httpx.HTTPStatusError` / `httpx.HTTPError` 를 분기.
@@ -34,7 +36,7 @@ langgraph-checkpoint-postgres==3.1.0
 langgraph-checkpoint==4.2.0
 # langsmith
 #   - LangGraph 실행 추적 SDK. 직접 import 없이 환경변수로 자동 연동된다.
-langsmith>=0.4.0,<1.0
+langsmith==0.12.2
 
 # psycopg[binary,pool]
 #   - langgraph-checkpoint-postgres 가 Postgres 연결에 사용하는 드라이버.
@@ -52,4 +54,4 @@ google-genai==2.3.0
 # cryptography: 다른 서비스로 보낼 좌표를 봉투에 담는다.
 #   표준 라이브러리에는 대칭 암호가 없어 이 하나를 들인다. 직접 구현하는
 #   선택지는 두지 않는다 — 인증 암호는 미묘하게 틀려도 겉으로는 동작한다.
-cryptography==45.0.7
+cryptography==50.0.1

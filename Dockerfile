@@ -35,16 +35,18 @@ COPY --from=builder /wheels /wheels
 COPY requirements.txt .
 # --no-index --find-links=/wheels: PyPI 접근 없이 builder 의 휠만으로 설치.
 RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+ && pip check \
  && rm -rf /wheels
 # 애플리케이션 소스를 app 사용자 소유로 복사.
 COPY --chown=app:app app ./app
 USER app
+RUN python -c "import app.main; from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver"
 EXPOSE 8000
 # HEALTHCHECK
 #   - /health 엔드포인트가 200 을 돌려주면 healthy.
 #   - start-period 동안은 실패해도 unhealthy 로 집계하지 않아 lifespan 초기화 여유를 둔다.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status==200 else 1)"
 # ENTRYPOINT
 #   - uvicorn 으로 app.main 모듈의 `app` (FastAPI 인스턴스) 를 0.0.0.0:8000 에 바인딩.
 ENTRYPOINT ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

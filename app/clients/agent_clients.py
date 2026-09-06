@@ -26,6 +26,7 @@ import redis.asyncio as aioredis
 from pydantic import BaseModel
 
 from app.crypto import location_seal
+from app.agent_settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -401,7 +402,7 @@ class StreamsPublisher:
             "payload": body,
         }
         dropped = False
-        if training_json:
+        if get_settings().TRAINING_CAPTURE_ENABLED and training_json:
             if len(training_json.encode("utf-8")) <= TRAINING_FIELD_MAX_BYTES:
                 fields["training"] = training_json
             else:
@@ -473,6 +474,8 @@ def _record_usage(resp, sink: list[dict] | None) -> None:
     total = getattr(meta, "total_token_count", None)
     if prompt is None and output is None and total is None:
         return
+    # 운영 비용 계량은 학습 캡처와 독립적이며 요청/장소/사용자 정보가 없다.
+    logger.info("llm usage prompt=%s output=%s total=%s", prompt, output, total)
     sink.append({"prompt": prompt, "output": output, "total": total})
 
 

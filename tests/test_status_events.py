@@ -49,9 +49,9 @@ class _FakeHub:
     ):
         return {
             "places": [
-                {"content_id": "c0", "name": "장소0", "address": "주소",
+                {"content_id": "c0", "source": "kakao", "name": "장소0", "address": "주소",
                  "lat": 37.5, "lng": 127.0},
-                {"content_id": "c1", "name": "장소1", "address": "주소",
+                {"content_id": "c1", "source": "kakao", "name": "장소1", "address": "주소",
                  "lat": 37.6, "lng": 127.1},
             ],
         }

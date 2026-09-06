@@ -78,6 +78,7 @@ GOLDEN: dict[str, dict[str, str]] = {
         "city": "str|req",
         "schedule_id": "Optional[str]|opt",
         "stage": "Literal[init,mode1,route]|opt",
+        "optimize": "bool|opt",
         "exclude": "Optional[list[str]]|opt",
         "places": "Optional[list[SelectedPlace]]|opt",
         # 감싼 장소가 들어오는 자리. 열쇠가 설정되면 이쪽만 받는다.

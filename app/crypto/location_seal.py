@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import time
 
@@ -113,7 +114,7 @@ def open_seal(token: str) -> dict:
         raise SealError("sealed value is not readable")
 
     issued = payload.get("iat")
-    if not isinstance(issued, (int, float)):
+    if type(issued) not in (int, float) or not math.isfinite(issued):
         raise SealError("sealed value has no issue time")
     age = time.time() - issued
     # 앞뒤로 흔들리는 시계를 감안해 미래 쪽도 조금 허용한다. 서버끼리 시계가

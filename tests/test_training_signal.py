@@ -16,6 +16,15 @@
 from __future__ import annotations
 
 import json
+import pytest
+
+from app.agent_settings import get_settings
+
+
+@pytest.fixture(autouse=True)
+def capture_enabled_for_legacy_contract(monkeypatch):
+    monkeypatch.setattr(get_settings(), "TRAINING_CAPTURE_ENABLED", True)
+
 
 from app.nodes.agent_nodes import TRAINING_SCHEMA_VERSION, _training_signal
 from app.schemas.agent_schemas import Place

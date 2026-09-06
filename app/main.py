@@ -73,6 +73,19 @@ from app.schemas.agent_schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _checkpoint_conninfo(settings) -> str:
+    """Keep reserved URI characters in credentials literal (never log this value)."""
+    from psycopg.conninfo import make_conninfo
+
+    return make_conninfo(
+        user=settings.POSTGRES_USER,
+        password=settings.POSTGRES_PASSWORD.get_secret_value(),
+        host=settings.POSTGRES_HOST,
+        port=settings.POSTGRES_PORT,
+        dbname=settings.POSTGRES_DB,
+    )
+
+
 def _configure_logging(level: str) -> None:
     """루트 로거에 stdout 핸들러를 붙인다(핸들러가 없을 때만).
 
@@ -212,13 +225,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             raise RuntimeError(
                 f"invalid LANGGRAPH_SCHEMA identifier: {schema!r}"
             )
-        conninfo = (
-            f"postgresql://{settings.POSTGRES_USER}:"
-            f"{settings.POSTGRES_PASSWORD.get_secret_value()}"
-            f"@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}"
-            f"/{settings.POSTGRES_DB}"
-        )
         try:
+            conninfo = _checkpoint_conninfo(settings)
             # 체크포인트에 실리는 대화 상태에는 좌표가 담긴다. 저장 전에
             # 봉하도록 serde 를 갈아 끼우고, 봉인 열쇠가 없거나 잘못돼
             # 있으면 여기서 부팅을 막는다 — 평문으로 저장하는 폴백은 두지
@@ -259,7 +267,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info(
                 "agent: langgraph checkpointer ready schema=%s", schema
             )
-        except Exception as e:
+        except Exception:
             # fail-fast 경로에서도 이미 생성한 클라이언트들을 대칭적으로
             # 정리한다 — finally 블록은 yield 이전 raise 로 도달 불가.
             if checkpoint_pool is not None:
@@ -273,7 +281,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             raise RuntimeError(
                 "langgraph checkpointer init failed (set "
                 "CHECKPOINT_ENABLED=false to boot without it)"
-            ) from e
+            ) from None
 
     app.state.checkpoint_pool = checkpoint_pool
     app.state.graph = build_graph(checkpointer=checkpointer)
@@ -534,13 +542,15 @@ def _resolve_places(req: AgentRequest) -> AgentRequest:
     # 두지 않으면 dict 인 채로 그래프까지 흘러가 장소를 읽는 첫 노드에서
     # 터진다 — 좌표 범위·글자 제한도 그때는 이미 지나간 뒤다.
     try:
-        parsed = [SelectedPlace.model_validate(p) for p in places]
+        resolved = AgentRequest.model_validate(
+            {**req.model_dump(), "places": places, "loc": None}
+        )
     except ValidationError:
         raise HTTPException(status_code=400, detail="invalid location")
     logger.info(
-        "location seal opened path=/v1/recommend places=%d", len(parsed)
+        "location seal opened path=/v1/recommend places=%d", len(resolved.places)
     )
-    return req.model_copy(update={"places": parsed, "loc": None})
+    return resolved
 
 
 @app.post(

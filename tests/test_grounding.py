@@ -201,30 +201,16 @@ def test_recommend_places_grounded_selection():
     assert all(p.grounded for p in places)
 
 
-def test_recommend_places_fallback_invent():
-    """후보가 없으면 LLM 생성 폴백 + grounded=False 표시."""
-    invented = InventedPlaces(
-        places=[
-            InventedPlace(
-                day=1,
-                name="가짜",
-                address="addr",
-                lat=37.5,
-                lng=127.0,
-                recommended_visit_time="오전",
-            )
-        ]
-    )
-    deps.set_gemini_client(_FakeGemini(invented))
+def test_no_candidates_fails_without_llm_invention():
+    spy = _SchemaSpyGemini(None)
+    deps.set_gemini_client(spy)
     try:
-        state = {"job_id": "j", "request": _request()}
-        out = asyncio.run(recommend_places(state))
+        out = asyncio.run(recommend_places({"job_id": "j", "request": _request()}))
     finally:
         deps.reset_all()
-    places = out["places"]
-    assert len(places) == 1
-    assert places[0].place_id == 0
-    assert places[0].grounded is False
+    assert "insufficient verified places" in out["error"]
+    assert not out.get("places")
+    assert spy.schemas == []
 
 
 def test_search_places_degraded_on_value_error():
@@ -294,49 +280,19 @@ class _SeqGemini:
         return self._results.pop(0)
 
 
-def test_select_empty_falls_back_to_invent_instead_of_failing():
-    """선택 결과가 비면 잡을 실패시키지 않고 생성 경로로 폴백한다.
-
-    후보가 극히 적거나 LLM 이 유효 index 를 못 고르면 선택 결과가 빈다.
-    예전에는 곧바로 error 를 세워 BFF 502 로 이어졌다. 이제는 남은 예산이
-    있으면 _invent_places 로 한 번 더 시도해야 한다.
-    """
-    # 1차: 범위 밖 index 만 반환 → 선택 0건. 2차: 생성 경로가 장소 1건 반환.
-    bad_selection = PlacesSelection(
-        selections=[
-            PlaceSelection(index=99, day=1, recommended_visit_time="오전")
-        ]
-    )
-    invented = InventedPlaces(
-        places=[
-            InventedPlace(
-                day=1,
-                name="생성장소",
-                address="addr",
-                lat=37.5,
-                lng=127.0,
-                recommended_visit_time="오전",
-            )
-        ]
-    )
-    gemini = _SeqGemini([bad_selection, invented])
+def test_invalid_selection_fails_without_invention_even_with_budget():
+    gemini = _SeqGemini([PlacesSelection(selections=[
+        PlaceSelection(index=99, day=1, recommended_visit_time="오전")
+    ])])
     deps.set_gemini_client(gemini)
     try:
-        state = {
-            "job_id": "j",
-            "request": _request(),
-            "candidates": [_candidate(0)],
-            "grounded": True,
-        }
-        out = asyncio.run(recommend_places(state))
+        out = asyncio.run(recommend_places({"job_id": "j", "request": _request(),
+                                           "candidates": [_candidate(0)], "grounded": True}))
     finally:
         deps.reset_all()
-
-    assert out.get("error") is None, "폴백이 동작하면 잡이 실패하면 안 된다"
-    assert len(out["places"]) == 1
-    assert out["places"][0].grounded is False
-    assert out.get("degraded_reason") == "select_empty_fallback_to_invent"
-    assert gemini.calls == 2
+    assert "insufficient verified places" in out["error"]
+    assert out["llm_calls_used"] == 1
+    assert not out.get("places")
 
 
 def test_select_empty_without_budget_still_fails():
@@ -364,7 +320,7 @@ def test_select_empty_without_budget_still_fails():
     finally:
         deps.reset_all()
 
-    assert out["error"] == "recommend_places returned empty"
+    assert "insufficient verified places" in out["error"]
     assert gemini.calls == 1
 
 
@@ -450,34 +406,6 @@ class _SchemaSpyGemini:
         self.schemas.append(schema)
         return self._result
 
-
-def test_invent_path_requests_the_slim_schema():
-    """창작 경로는 슬림 스키마로 묻는다.
-
-    응답 스키마는 프롬프트 입력으로 함께 실려 나가므로, 쓰지 않는 필드가
-    붙은 스키마를 넘기면 매 호출이 그만큼 비싸진다. 대역이 schema 인자를
-    무시하고 미리 만든 객체를 돌려주는 구조라, 어떤 스키마로 물었는지는
-    여기서 따로 확인하지 않으면 조용히 어긋난다.
-    """
-    invented = InventedPlaces(
-        places=[
-            InventedPlace(
-                day=1,
-                name="가짜",
-                address="addr",
-                lat=37.5,
-                lng=127.0,
-                recommended_visit_time="오전",
-            )
-        ]
-    )
-    spy = _SchemaSpyGemini(invented)
-    deps.set_gemini_client(spy)
-    try:
-        asyncio.run(recommend_places({"job_id": "j", "request": _request()}))
-    finally:
-        deps.reset_all()
-    assert spy.schemas == [InventedPlaces]
 
 
 def test_slim_schema_has_no_downstream_only_fields():

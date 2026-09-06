@@ -39,10 +39,11 @@
 ## 쓰는 법
 
 케이스 하나당 결과 파일 하나를 `<case_id>.json` 으로 모아 둔다. 내용은 완료
-페이로드 그대로다. 학습 신호를 함께 모으면 grounded 축이 채워진다.
+페이로드 그대로다. grounded 축은 완료 결과의 `grounded`, `source`, `content_id`로
+평가하며 학습 수집·반출을 켤 필요가 없다. `--training`은 과거 자료의 선택적 진단용이다.
 
 ```
-python -m eval.run --results out/gemini --training out/gemini-training
+python -m eval.run --results out/gemini
 python -m eval.run --results out/gemini --baseline eval/baseline.json
 python -m eval.run --results out/gemini --baseline eval/baseline.json --write-baseline
 ```
@@ -50,10 +51,11 @@ python -m eval.run --results out/gemini --baseline eval/baseline.json --write-ba
 기준선을 주면 축마다 견주어, 나빠진 폭이 허용치를 넘을 때 0 이 아닌 값으로
 끝난다. 사람이 표를 눈으로 대조하지 않아도 회귀가 드러난다.
 
-**기준선 파일은 아직 없다.** 실제 실행 결과로 적어야 하기 때문이다. 만들어 둔
-숫자를 넣으면 "재 봤다" 처럼 보이지만 아무 것도 재지 않은 것이 되고, 그 위에서
-내리는 모델 교체 판단이 통째로 근거를 잃는다. 첫 실행 때 `--write-baseline`
-으로 적는다.
+기존 `baseline.json`은 보존한다. 변경된 검증기는 숫자 좌표 범위, 출처,
+종료 시각·체류·이동 시간·시각 누락 및 명시하지 않은 수동 순서 변경을 검사한다.
+기준선 유무와 관계없이 기본 품질 실패는 종료값 1이며 불량 결과로 기준선을
+덮어쓸 수 없다. `invented_ratio`는 기존 비교 키를 유지하며 실측 확인이 안 된
+결과 비율을 포함한다.
 
 종료값 규약:
 
@@ -63,7 +65,8 @@ python -m eval.run --results out/gemini --baseline eval/baseline.json --write-ba
 | 기준선 대비 회귀 | 1 |
 | 기준선 파일 없음 | 1 |
 | 결과가 없는 케이스가 있음 | 1 |
-| 기준선을 주지 않음(채점만) | 0 |
+| 기본 품질 기준 미달 | 1 |
+| 기준선을 주지 않고 기본 품질 통과 | 0 |
 
 결과가 빠진 케이스에서 멈추는 이유: 조용히 넘기면 통과율이 남은 것들로만
 계산돼 오히려 좋아 보인다.

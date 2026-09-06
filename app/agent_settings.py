@@ -260,6 +260,9 @@ class AgentSettings(BaseSettings):
     # RULES_ENABLED=false 일 때도 함께 꺼진다.
     PERSONALIZATION_ENABLED: bool = True
 
+    # 학습 HOLD: 완료 결과와 운영 사용량은 유지하되 학습 전용 신호는 만들지 않는다.
+    TRAINING_CAPTURE_ENABLED: bool = False
+
     # 세어 둔 성향별 저장 비율을 랭킹에 얹을지. 파일 경로가 비어 있거나
     # 파일이 없으면 켜져 있어도 아무 일도 하지 않는다.
     SEGMENT_STATS_PATH: str = ""

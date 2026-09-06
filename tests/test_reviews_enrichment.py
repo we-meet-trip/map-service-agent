@@ -309,6 +309,7 @@ def test_recommend_places_no_reviews_on_fetch_failure() -> None:
     deps.set_hub_client(_ReviewHub(exc=httpx.ConnectError("down")))
     deps.set_gemini_client(_SelectGemini(PlacesSelection(selections=[
         PlaceSelection(index=0, day=1, recommended_visit_time="오전"),
+        PlaceSelection(index=1, day=1, recommended_visit_time="오후"),
     ])))
     state = {"job_id": "j", "request": _request(),
              "candidates": cands, "grounded": True}
@@ -318,4 +319,4 @@ def test_recommend_places_no_reviews_on_fetch_failure() -> None:
         deps.reset_all()
     assert out.get("error") is None
     assert "reviews" not in out
-    assert len(out["places"]) == 1
+    assert len(out["places"]) == 2
