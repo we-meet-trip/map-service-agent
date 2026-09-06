@@ -47,3 +47,52 @@ jobs:
       - name: build runtime image
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_image }}
         run: docker build --tag map-runtime:ci .
+
+  # Optional cross-repository release request; the infra receiver verifies this run.
+  release-dispatch:
+    needs: [test]
+    if: >-
+      needs.test.result == 'success' &&
+      github.repository == 'we-meet-trip/map-service-agent' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      RELEASE_DISPATCH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
+    steps:
+      - name: request verified develop release
+        if: ${{ env.RELEASE_DISPATCH_TOKEN != '' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          payload = {
+              "event_type": "release-develop",
+              "client_payload": {
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+                  "sha": os.environ["GITHUB_SHA"],
+                  "run_id": os.environ["GITHUB_RUN_ID"],
+              },
+          }
+          try:
+              request = urllib.request.Request(
+                  "https://api.github.com/repos/we-meet-trip/map-service-infra/dispatches",
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + os.environ["RELEASE_DISPATCH_TOKEN"],
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  if response.status != 204:
+                      raise SystemExit("Release dispatch failed")
+          except Exception:
+              # Never expose the token, response body, or exception details.
+              raise SystemExit("Release dispatch failed") from None
+          PY
