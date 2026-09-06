@@ -305,10 +305,23 @@ def _segment_stats() -> dict:
         return {}
     try:
         with open(path, encoding="utf-8") as f:
-            _SEGMENT_STATS = json.load(f)
-        segments = (_SEGMENT_STATS or {}).get("segments") or {}
+            stats = json.load(f)
+        if not isinstance(stats, dict):
+            raise ValueError("invalid segment stats object")
+        segments = stats.get("segments", {})
+        if not isinstance(segments, dict):
+            raise ValueError("invalid segments object")
+        for segment in segments.values():
+            if not isinstance(segment, dict):
+                raise ValueError("invalid segment object")
+            places = segment.get("places", {})
+            if not isinstance(places, dict) or any(
+                not isinstance(entry, dict) for entry in places.values()
+            ):
+                raise ValueError("invalid segment places object")
+        _SEGMENT_STATS = stats
         logger.info("segment stats loaded segments=%d path=%s", len(segments), path)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         # 통계를 못 읽는 것이 추천을 막아서는 안 된다. 없는 것으로 친다.
         logger.warning("segment stats load failed path=%s reason=%s",
                        path, type(e).__name__)
@@ -322,15 +335,27 @@ def _segment_gain(candidate: dict, segment: dict | None) -> float:
     문턱을 못 넘어 통계에 없는 곳은 0 이다. 한두 번의 우연을 취향으로 굳히지
     않으려는 것이고, 그 판정은 통계를 만드는 쪽에서 이미 끝났다.
     """
-    if not segment:
+    if not isinstance(segment, dict):
         return 0.0
     cid = candidate.get("content_id")
     if not cid:
         return 0.0
-    entry = (segment.get("places") or {}).get(cid)
-    if not entry:
+    places = segment.get("places")
+    if not isinstance(places, dict):
         return 0.0
-    return _AFFINITY_MAX * float(entry.get("rate") or 0.0)
+    entry = places.get(cid)
+    if not isinstance(entry, dict):
+        return 0.0
+    raw_rate = entry.get("rate")
+    if isinstance(raw_rate, bool):
+        return 0.0
+    try:
+        rate = float(raw_rate)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+        return 0.0
+    return _AFFINITY_MAX * rate
 
 
 def _segment_for(age_band: str | None, gender: str | None) -> dict | None:
