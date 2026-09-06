@@ -74,7 +74,13 @@ class _FakeHub:
 
     async def search_places(self, province, city, **kwargs):
         self.search_calls += 1
-        return {"places": [], "count": 0}
+        selected = _selected() + [
+            SelectedPlace(name="속초해변", lat=38.19, lng=128.60, category="여행 / 관광,명소 / 해수욕장,해변"),
+            SelectedPlace(name="영금정", lat=38.21, lng=128.60),
+        ]
+        places = [{**p.model_dump(), "content_id": p.content_id or f"kakao:{i}", "source": "kakao"}
+                  for i, p in enumerate(selected) if p.name == kwargs.get("keyword")]
+        return {"places": places, "count": len(places)}
 
     async def estimate_dwell(self, places):
         # 체류시간은 hub 룰이 정한다. 여기서는 요청한 장소마다 같은 값을
@@ -152,6 +158,13 @@ def _invoke(req, hub, gemini):
 
 
 # ── 요청 스키마 ────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def verified_search_results():
+    deps.set_hub_client(_FakeHub())
+    yield
+    deps.reset_all()
+
 
 def test_places_require_two_to_ten() -> None:
     """장소 1개는 동선을 이을 수 없고, 11개는 상한을 넘는다.
@@ -274,7 +287,7 @@ def test_route_stage_skips_search_and_selection() -> None:
 
     out, pub = _invoke(_request(), hub, gemini)
 
-    assert hub.search_calls == 0
+    assert hub.search_calls == 2
     assert gemini.calls == 1
     assert out.get("error") is None
     payload = pub.payloads[0]

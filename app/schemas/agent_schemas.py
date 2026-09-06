@@ -226,6 +226,8 @@ class AgentRequest(BaseModel):
     city: str = Field(min_length=1, max_length=20)
     schedule_id: Optional[str] = Field(default=None, max_length=64)
     stage: Literal["init", "mode1", "route"] = "init"
+    # route 요청은 사용자가 고른 순서가 기본이다. 명시 요청에만 최적화한다.
+    optimize: bool = False
     exclude: Optional[
         List[Annotated[str, Field(min_length=1, max_length=64)]]
     ] = Field(default=None, max_length=50)

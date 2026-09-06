@@ -101,6 +101,16 @@ def main() -> int:
     print(json.dumps({"summary": current, "cases": scored},
                      ensure_ascii=False, indent=2))
 
+    failed = [s["case_id"] for s in scored if (
+        not s["schema"]["ok"] or not s["grounded"].get("grounded")
+        or not s["route"].get("ok")
+        or (s["rules"].get("applicable") and s["rules"]["violations"] > 0)
+        or (s["timeline"].get("applicable") and not s["timeline"].get("ok"))
+    )]
+    if failed or not scored:
+        print(f"\n✗ 기본 품질 기준 미달: {', '.join(failed) or '평가 케이스 없음'}")
+        return 1
+
     if args.write_baseline and args.baseline:
         Path(args.baseline).write_text(
             json.dumps(current, ensure_ascii=False, indent=2) + "\n",

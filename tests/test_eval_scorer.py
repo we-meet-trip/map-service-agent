@@ -19,9 +19,11 @@ from eval.scorer import (
 
 def _place(pid: int, day: int, lat: float, lng: float, start: str | None = None) -> dict:
     p = {"place_id": pid, "day": day, "name": f"장소{pid}",
-         "address": "주소", "lat": lat, "lng": lng}
+         "address": "주소", "lat": lat, "lng": lng,
+         "grounded": True, "source": "kakao", "content_id": f"kakao:{pid}"}
     if start:
         p["visit_start"] = start
+        p["visit_end"] = start
     return p
 
 
@@ -29,6 +31,8 @@ def _payload(places: list[dict], order: list[int] | None = None) -> dict:
     body = {"status": "done", "places": places}
     if order is not None:
         body["visit_order"] = order
+        body["legs"] = [{"from": a, "to": b, "estimated_duration_min": 0}
+                        for a, b in zip(order, order[1:])]
     return body
 
 
@@ -172,6 +176,7 @@ class TestTimelineUsesVisitOrder:
                     "lng": 127.0,
                     "recommended_visit_time": t,
                     "visit_start": t,
+                    "visit_end": t,
                 }
                 for i, t in enumerate(times)
             ],

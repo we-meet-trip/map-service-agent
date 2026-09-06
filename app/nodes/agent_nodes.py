@@ -41,7 +41,6 @@ from app.security.sanitize import (
 from app.llm.structured_call import LLMBudgetExceeded
 from app.schemas.agent_schemas import (
     AgentRequest,
-    InventedPlaces,
     JobDonePayload,
     Leg,
     Mobility,
@@ -622,6 +621,14 @@ async def parse_input(state: AgentState) -> AgentState:
     if d.time_start >= d.time_end:
         state["error"] = "time_start must be < time_end"
         return state
+    if req.places and any(p.day > _num_days(req) for p in req.places):
+        state["error"] = "selected place day exceeds the date range"
+        return state
+    if req.stage == "route" and req.places:
+        days = [p.day for p in req.places]
+        if days != sorted(days):
+            state["error"] = "selected places must be in day order"
+            return state
     if req.stage == "route":
         if not req.places:
             state["error"] = "stage=route requires places"
@@ -633,26 +640,11 @@ async def parse_input(state: AgentState) -> AgentState:
 
 
 async def load_given_places(state: AgentState) -> AgentState:
-    """사용자가 고른 장소를 그대로 `state["places"]` 로 세운다.
+    """고른 장소를 출처 검색으로 확인하고 배열 순서대로 세운다.
 
-    stage="route" 전용 노드다. 후보 탐색·룰 필터·랭킹·선정을 모두 건너뛰므로
-    LLM 호출도 이 단계에서는 0회다 — 사용자가 이미 고른 것을 다시 고를 이유가
-    없다.
-
-    place_id 는 요청에 실린 순서대로 0..N-1 로 매긴다(선정 경로가 후보에
-    붙이는 방식과 같다). 이 번호가 뒤따르는 동선·이유·요약 노드가 장소를
-    지목하는 유일한 키다.
-
-    grounded=True 로 둔다 — 사용자가 지도에서 실제로 고른 지점이라 LLM 이
-    지어낸 장소와 신뢰도가 다르다. 방문 시각은 비워 둔다(동선이 정해진 뒤
-    BFF 가 활동 시간대를 나눠 채운다).
-
-    일차는 요청에 실린 값을 그대로 쓰되(없으면 요청 스키마가 1일차로 접는다)
-    여행 일수를 넘는 값은 마지막 날로 당긴다. 그리고 일차 오름차순으로 정렬해
-    place_id 를 매긴다 — 동선 노드가 방문 순서를 일차 단위로 묶어 검증하므로
-    번호 순서와 일차 순서가 어긋나면 그 검증에 걸린다.
-
-    좌표·문자 검증은 요청 스키마가 이미 마쳤으므로 여기서 다시 하지 않는다.
+    content_id가 있으면 출처 ID, 없으면 정확한 이름과 100m 이내 좌표로
+    대조한다. 이름/좌표/분류는 확인된 출처 값으로 정규화한다. 확인 실패는
+    오류이며 임의 장소를 grounded=True로 표시하지 않는다.
     """
     await _emit_stage(state, "load_given_places")
     if state.get("error"):
@@ -665,25 +657,58 @@ async def load_given_places(state: AgentState) -> AgentState:
     # 사용자가 직접 고른 경로다. 후보 목록도 랭킹도 거치지 않으므로 학습에서
     # 다른 경로와 같이 묶으면 안 된다.
     state["selection_path"] = "route"
-    state["places"] = _places_from_selected(selected, _num_days(req))
-    state["grounded"] = True
+    state["places"] = await _verify_selected_places(state, selected)
+    state["grounded"] = not bool(state.get("error"))
     return state
+
+
+async def _verify_selected_places(
+    state: AgentState, selected: list[SelectedPlace]
+) -> list[Place]:
+    """지도에서 되돌려 받은 값도 출처 검색 결과와 대조하고 원본 좌표를 쓴다."""
+    from app.agent_dependencies import get_hub_client
+
+    req = state["request"]
+    verified: list[Place] = []
+    try:
+        client = get_hub_client()
+        for given in selected:
+            response = await client.search_places(
+                req.province, req.city, keyword=given.name[:40], size=15
+            )
+            match = None
+            for candidate in response.get("places") or []:
+                try:
+                    place = _place_from_candidate(len(verified), candidate, "", given.day)
+                except (ValidationError, ValueError, TypeError, KeyError, AttributeError):
+                    continue
+                matches_id = given.content_id and given.content_id == place.content_id
+                matches_location = (
+                    not given.content_id and given.name.strip() == place.name.strip()
+                    and _straight_km(given.lat, given.lng, place.lat, place.lng) <= 0.1
+                )
+                if matches_id or matches_location:
+                    match = place
+                    break
+            if match is None:
+                state["error"] = "selected place could not be verified with its source"
+                return []
+            verified.append(match)
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, RuntimeError):
+        state["error"] = "selected places verification unavailable"
+        return []
+    return verified
 
 
 def _places_from_selected(
     selected: list[SelectedPlace], num_days: int
 ) -> list[Place]:
-    """사용자가 지목한 장소를 `Place` 로 옮긴다 — 일차 오름차순, 번호 0..N-1.
-
-    번호와 일차 순서가 어긋나면 동선 검증에 걸리므로 정렬을 먼저 한다.
-    분류는 새로 알아낼 길이 없어 호출 측이 되돌려 준 값을 그대로 싣는다.
-    좌표·문자 검증은 요청 스키마가 이미 마쳤다.
-    """
-    ordered = sorted(selected, key=lambda p: min(p.day, num_days))
+    """남길 장소 수를 계산할 중간 표현. 실존 확인은 별도 비동기 단계가 맡는다."""
+    ordered = selected
     return [
         Place(
             place_id=i,
-            day=min(p.day, num_days),
+            day=p.day,
             name=p.name,
             address=p.address,
             lat=p.lat,
@@ -691,7 +716,7 @@ def _places_from_selected(
             recommended_visit_time="",
             content_id=p.content_id,
             category=p.category,
-            grounded=True,
+            grounded=False,
         )
         for i, p in enumerate(ordered)
     ]
@@ -1324,35 +1349,19 @@ async def score_and_rank(state: AgentState) -> AgentState:
 
 
 async def recommend_places(state: AgentState) -> AgentState:
-    """후보 장소 선정 — grounded 면 실측 후보에서 고르고, 아니면 LLM 생성.
+    """실측 후보에서만 선정한다. 후보 부족/선택 실패는 명시 오류로 끝낸다.
 
-    선조건 분기: `state["error"]` 가 있으면 그대로 no-op.
-
-    분기:
-      - `state["candidates"]` 가 있으면 `_select_places` 로 위임한다
-        (실측 후보 중 선택, grounded=True).
-      - 후보가 없으면 `_invent_places` 로 위임한다(LLM 단독 생성,
-        grounded=False — 저신뢰 표시).
-
-    어느 경로든 결과를 place_id 0..N-1 로 매겨 `state["places"]` 에 저장하며,
-    이는 `Leg.from_place_id`/`Leg.to_place_id` 검증과의 일관성을 위함이다.
-
-    후보 절단:
-      선정 프롬프트에 싣기 직전에 후보 수를 상한까지 줄인다. 앞 노드들이
-      실패로 통과했을 때도 반드시 걸리도록 이 한 곳에서만 자른다.
-
-    재탐색에서 남길 장소:
-      stage="mode1" 에 places 가 실려 오면 "이건 그대로 두라"는 뜻이다.
-      그 장소들을 먼저 세우고 그날 뽑을 수를 그만큼 줄인 다음, 남은 자리만
-      평소 경로로 채워 하나로 합친다. 남길 것이 그날 몫을 이미 채웠으면
-      모델을 부르지 않는다 — 부를 이유가 없다.
-
-    호출처: LangGraph(score_and_rank 다음).
+    mode1에서 유지한 장소도 출처를 확인한 뒤 새 선정 결과와 병합한다.
+    모델에는 후보 인덱스만 고르게 하며 장소/좌표를 창작하는 경로는 없다.
     """
     await _emit_stage(state, "recommend_places")
     if state.get("error"):
         return state
     pinned = _pinned_places(state)
+    if pinned:
+        pinned = await _verify_selected_places(state, state["request"].places)
+        if state.get("error"):
+            return state
     if pinned and not _remaining_targets(state, pinned):
         # 남길 장소가 그날 몫을 전부 채웠다. 더 뽑을 자리가 없다.
         state["places"] = pinned
@@ -1364,10 +1373,16 @@ async def recommend_places(state: AgentState) -> AgentState:
         state["selection_path"] = "select"
         state = await _select_places(state, candidates)
     else:
-        state["selection_path"] = "invent"
-        state = await _invent_places(state)
+        state["error"] = "insufficient verified places: no search candidates"
     if pinned and not state.get("error"):
         state["places"] = _merge_pinned(pinned, state.get("places") or [])
+    if not state.get("error"):
+        places = state.get("places") or []
+        if len(places) < 2 or any(
+            not any(p.day == day for p in places)
+            for day in range(1, _num_days(state["request"]) + 1)
+        ):
+            state["error"] = "insufficient verified places for the requested days"
     return state
 
 
@@ -1486,6 +1501,10 @@ def _place_from_candidate(
     # skip 규칙을 탄다. 단 category 는 Kakao 가 계층 구분자로 `>` 를 항상
     # 넣으므로(예 "음식점 > 카페") neutralize_tags 로 `/` 치환해 전 후보가
     # 조용히 드롭되는 것을 막는다. 방문시간(LLM 출력)도 같은 이유로 정규화.
+    if not isinstance(c.get("content_id"), str) or not c["content_id"].strip():
+        raise ValueError("candidate has no source identifier")
+    if c.get("source") not in {"kakao", "durunubi"} or "stub" in c["content_id"].lower():
+        raise ValueError("candidate is not a verified source place")
     return Place(
         place_id=place_id,
         day=day,
@@ -1699,86 +1718,9 @@ async def _select_places(
             state.get("job_id"), len(candidates),
             len(envelope.selections), len(chosen),
         )
-        # 실측 후보로 장소를 못 만든 경우에도 잡 전체를 실패시키지 않고 생성
-        # 경로로 한 번 더 시도한다. 후보가 극히 적거나(예: 검색어 조합 때문에
-        # 1건만 남음) LLM 이 유효 index 를 못 고르면 여기로 오는데, 예전에는
-        # 곧바로 error 를 세워 BFF 502 로 이어졌다. 잔여 예산이 없으면 기존대로
-        # 실패시킨다(예산 초과 방지).
-        settings = get_settings()
-        budget = settings.GEMINI_MAX_CALLS_PER_REQUEST
-        if state.get("llm_calls_used", 0) < budget:
-            logger.warning(
-                "recommend_places falling back to invent job_id=%s",
-                state.get("job_id"),
-            )
-            state["degraded_reason"] = "select_empty_fallback_to_invent"
-            # degraded_reason 은 뒤 단계가 자기 사유로 덮으므로 경로는 따로 남긴다.
-            state["selection_path"] = "select_then_invent"
-            return await _invent_places(state)
-        state["error"] = "recommend_places returned empty"
+        state["error"] = "insufficient verified places: selection returned empty"
         return state
     state["places"] = places
-    return state
-
-
-async def _invent_places(state: AgentState) -> AgentState:
-    """폴백 경로 — 실측 후보가 없을 때 LLM 이 장소를 생성한다.
-
-    생성 프롬프트로 `InventedPlaces` 를 받고, place_id 0..N-1 로 정규화하며
-    각 장소를 grounded=False(저신뢰) 로 표시한다.
-    호출은 `call_structured`(예산 + 교정 재시도)를 거친다.
-    """
-    req = state["request"]
-    weather = state.get("weather", {})
-    system, prompt = _build_places_prompt(req, weather)
-    try:
-        envelope = await call_structured(
-            state,
-            prompt,
-            InventedPlaces,
-            system_instruction=system,
-            max_calls=get_settings().GEMINI_MAX_CALLS_PER_REQUEST,
-        )
-    except Exception as e:
-        logger.warning(
-            "recommend_places(invent) failed job_id=%s err=%s: %s",
-            state.get("job_id"), type(e).__name__, e,
-        )
-        state["error"] = f"recommend_places failed: {e}"
-        return state
-    if not envelope.places:
-        logger.warning(
-            "recommend_places(invent) empty job_id=%s", state.get("job_id")
-        )
-        state["error"] = "recommend_places returned empty"
-        return state
-    # 이 경로는 장소 전체를 LLM 이 만들므로 일차가 하나라도 범위를 벗어나면
-    # 결과 전체를 신뢰할 수 없다고 보고 중단한다(1 미만은 스키마가 막는다).
-    num_days = _num_days(req)
-    if any(p.day > num_days for p in envelope.places):
-        state["error"] = f"place day out of range (1..{num_days})"
-        return state
-    # 응답을 Place 로 옮기며 place_id 를 0..N-1 로 매기고 실측 근거 없음을
-    # 표시한다. 일차 순서대로 매겨 동선 단계의 정렬 제약과 어긋나지 않게
-    # 한다. 나머지 필드는 채우지 않는다 — 실측 출처에서만 나오는 값이거나,
-    # 뒤의 시간축·이유 단계가 채울 값이다. 응답 스키마에 그 자리가 아예
-    # 없으므로 모델이 근거 없는 값을 흘려 넣을 경로도 없다.
-    normalized = [
-        Place(
-            place_id=i,
-            day=p.day,
-            name=p.name,
-            address=p.address,
-            lat=p.lat,
-            lng=p.lng,
-            recommended_visit_time=p.recommended_visit_time,
-            grounded=False,
-        )
-        for i, p in enumerate(
-            sorted(envelope.places, key=lambda p: p.day)
-        )
-    ]
-    state["places"] = normalized
     return state
 
 
@@ -1815,7 +1757,12 @@ async def recommend_route(state: AgentState) -> AgentState:
         state["error"] = "recommend_route has no places"
         return state
 
-    order = _order_places(places)
+    req = state["request"]
+    order = (
+        [p.place_id for p in places]
+        if req.stage == "route" and not req.optimize
+        else _order_places(places)
+    )
     state["visit_order"] = order
     probe: AgentState = {
         "job_id": state["job_id"],
@@ -2199,8 +2146,8 @@ async def fit_time_budget(state: AgentState) -> AgentState:
     장소를 덜어 내면 visit_order 와 legs 를 다시 맞춘다 — 그러지 않으면
     "legs 길이 = 장소 수 - 1" 계약이 깨져 하류 조립이 실패한다.
 
-    이 노드는 에러를 세우지 않는다. 넘치는 일정이라도 내보내는 편이
-    아무것도 못 주는 것보다 낫고, 줄였다는 사실은 timeline_status 로 알린다.
+    수동 방문지는 삭제하지 않으며 시간 초과 시 실패한다. 자동 일정도
+    줄인 뒤 활동 시간에 들어오는지 다시 확인해야 성공할 수 있다.
 
     호출처: LangGraph(build_timeline 다음).
     """
@@ -2211,6 +2158,12 @@ async def fit_time_budget(state: AgentState) -> AgentState:
     settings = get_settings()
     overflowed = state.get("timeline_overflow_days") or []
     if not settings.TIMELINE_ENABLED or not overflowed:
+        return state
+
+    # 수동으로 정한 방문지를 시간에 맞춘다는 이유로 몰래 삭제하지 않는다.
+    if state["request"].stage == "route":
+        state["timeline_status"] = "unverified"
+        state["error"] = "selected places exceed the activity time budget"
         return state
 
     places = state.get("places") or []
@@ -2256,7 +2209,12 @@ async def fit_time_budget(state: AgentState) -> AgentState:
         state["visit_order"] = order
         state["legs"] = _rebuild_legs(state, order)
 
-    timeline, _ = _plan_timeline_with(state, stay_by_id, order, dropped)
+    timeline, still_overflowed = _plan_timeline_with(state, stay_by_id, order, dropped)
+    if still_overflowed:
+        state["timeline_status"] = "unverified"
+        state["timeline_overflow_days"] = still_overflowed
+        state["error"] = "verified places exceed the activity time budget"
+        return state
     for pid, slot in timeline.items():
         old = (state.get("timeline") or {}).get(pid) or {}
         slot["stay_source"] = old.get("stay_source", "default")
@@ -2442,7 +2400,7 @@ def _training_signal(state: AgentState) -> str | None:
     모든 접근은 get 으로 한다. route 나 저하 경로에서는 후보·점수 키가 아예
     없으며, 여기서 KeyError 가 나면 결과 발행 자체가 막힌다.
     """
-    if state.get("error"):
+    if not get_settings().TRAINING_CAPTURE_ENABLED or state.get("error"):
         return None
     path = state.get("selection_path")
     if not path:

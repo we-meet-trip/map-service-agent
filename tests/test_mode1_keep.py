@@ -79,6 +79,20 @@ def _state(req: AgentRequest, targets: list[int] | None = None) -> dict:
     return state
 
 
+class _VerifiedHub:
+    async def search_places(self, province, city, *, keyword, size):
+        ids = {"A": "c1", "B": "c2", "남길곳": "kakao:1"}
+        return {"places": [{"name": keyword, "content_id": ids.get(keyword), "source": "kakao",
+                            "lat": 37.5, "lng": 127.0, "address": "주소"}]}
+
+
+@pytest.fixture(autouse=True)
+def verified_search_results():
+    deps.set_hub_client(_VerifiedHub())
+    yield
+    deps.reset_all()
+
+
 def test_places_lower_bound_allows_single_keep() -> None:
     """남길 곳이 한 군데뿐인 재탐색도 정상 요청이다."""
     req = _request(stage="mode1", places=[_selected("A", "c1")])
