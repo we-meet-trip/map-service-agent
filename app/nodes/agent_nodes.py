@@ -492,7 +492,9 @@ def _weather_brief(weather) -> dict:
         for key, bucket in (("temp_min", lows), ("temp_max", highs),
                             ("precipitation_prob", pops)):
             v = d.get(key)
-            if isinstance(v, (int, float)):
+            if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and math.isfinite(v) and -900 < v < 900
+                    and (key != "precipitation_prob" or 0 <= v <= 100)):
                 bucket.append(int(v))
         sky = d.get("sky_condition")
         if isinstance(sky, str) and sky and sky not in skies:
@@ -784,14 +786,13 @@ async def fetch_weather(state: AgentState) -> AgentState:
             req.date.date_end,
         )
     except httpx.HTTPStatusError as e:
-        logger.warning(
-            "hub /v1/weather %s: %s",
-            e.response.status_code, e.response.text[:200],
-        )
+        logger.warning("hub /v1/weather HTTP_%s", e.response.status_code)
+        state.pop("weather", None)
         _add_warning(state, _WARN_WEATHER_UNAVAILABLE)
         return state
     except httpx.HTTPError as e:
         logger.warning("hub /v1/weather unreachable: %s", type(e).__name__)
+        state.pop("weather", None)
         _add_warning(state, _WARN_WEATHER_UNAVAILABLE)
         return state
     state["weather"] = weather
@@ -828,7 +829,7 @@ def _warn_missing_forecast_days(
         _add_warning(
             state,
             f"{', '.join(sorted(hit))} 는 날씨 예보를 확인하지 못해 "
-            "강수확률 0 으로 계산했습니다",
+            "해당 날짜에 날씨 조건을 반영하지 못했습니다",
         )
 
 
@@ -881,15 +882,15 @@ async def plan_strategy(state: AgentState) -> AgentState:
     return state
 
 
-def _daily_pops(weather, date_start: date, num_days: int) -> list[int]:
+def _daily_pops(weather, date_start: date, num_days: int) -> list[int | None]:
     """일차별 강수확률(%)을 여행 일수만큼 뽑는다.
 
     날짜로 맞춘다. 배열 위치로 세면 안 되는 이유가 있다 — hub 는 예보를
     구하지 못한 날을 목록에서 빼고 보낸다. 그러면 첫날 자리에 며칠 뒤 값이
     들어와, 맑은 날을 비 오는 날로 보고 실내로 몰거나 그 반대가 된다.
 
-    값이 없는 날은 0 으로 둔다. 모르는 날을 비 온다고 가정하면 근거 없이
-    실내로 몰리므로, 모를 때는 아무 편향도 주지 않는 쪽을 택한다.
+    값이 없는 날은 None이다. 날씨 가중치를 적용하지 않는다는 사실과
+    공급자가 강수확률 0%를 예보했다는 사실을 구분한다.
     """
     by_date: dict[str, int] = {}
     if isinstance(weather, dict):
@@ -898,10 +899,11 @@ def _daily_pops(weather, date_start: date, num_days: int) -> list[int]:
                 continue
             key = str(d.get("date") or "")
             value = d.get("precipitation_prob")
-            if key and isinstance(value, (int, float)):
+            if (key and isinstance(value, (int, float))
+                    and not isinstance(value, bool) and 0 <= value <= 100):
                 by_date[key] = int(value)
     return [
-        by_date.get((date_start + timedelta(days=i)).isoformat(), 0)
+        by_date.get((date_start + timedelta(days=i)).isoformat())
         for i in range(num_days)
     ]
 
@@ -924,13 +926,15 @@ def _target_stops(active_minutes: int) -> int:
     return max(_STOPS_MIN, min(_STOPS_MAX, fits))
 
 
-def _indoor_ratio(pop: int) -> float:
+def _indoor_ratio(pop: int | None) -> float:
     """그날 강수확률로 실내 비중을 정한다.
 
     hub 실내 가점이 50% 를 임계로 쓰므로 같은 기준을 따른다. 비가 확실할수록
     실내를 늘리되, 전부 실내로 채우지는 않는다 — 여행지에서 하루 종일 실내만
     도는 일정은 사용자가 기대한 것이 아니다.
     """
+    if pop is None:
+        return 0.0  # no weather weighting; precipitation remains unknown
     if pop >= 70:
         return 0.7
     if pop >= 50:
@@ -1292,11 +1296,13 @@ async def score_and_rank(state: AgentState) -> AgentState:
     if plan_days:
         day_pop_max = max(
             (
-                int(d.get("precipitation_prob") or 0)
+                int(d["precipitation_prob"])
                 for d in plan_days
-                if isinstance(d, dict)
+                if isinstance(d, dict) and isinstance(d.get("precipitation_prob"), (int, float))
+                and not isinstance(d.get("precipitation_prob"), bool)
+                and 0 <= d["precipitation_prob"] <= 100
             ),
-            default=0,
+            default=None,
         )
     else:
         weather = state.get("weather") or {}
@@ -1306,7 +1312,8 @@ async def score_and_rank(state: AgentState) -> AgentState:
         pops = [
             d.get("precipitation_prob") for d in daily if isinstance(d, dict)
         ]
-        day_pop_max = max((p for p in pops if p is not None), default=0)
+        day_pop_max = max((p for p in pops if isinstance(p, (int, float))
+                           and not isinstance(p, bool) and 0 <= p <= 100), default=None)
     # 채점 대상 pois: content_id 가 있는 후보만. indoor_flag 는 Kakao
     # category_group_code 가 실내 성향 그룹에 속하는지로 판정, base_score 는
     # 현재 랭크 순서를 반영한 rank-decay(1.0 - 0.01*i) 에 테마 친화 가점을

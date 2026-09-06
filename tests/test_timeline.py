@@ -314,6 +314,6 @@ def test_plan_strategy_matches_weather_by_date_not_position() -> None:
 
     days = out["plan"]["days"]
     # 1·2일차는 예보가 없으므로 편향 없음. 3일차만 90 을 받는다.
-    assert [d["precipitation_prob"] for d in days] == [0, 0, 90]
+    assert [d["precipitation_prob"] for d in days] == [None, None, 90]
     assert days[0]["indoor_ratio"] == 0.0
     assert days[2]["indoor_ratio"] > 0.0
