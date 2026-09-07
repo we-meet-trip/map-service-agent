@@ -1,7 +1,7 @@
 """stage="route" — 사용자가 고른 장소로 동선만 짜는 경로 테스트.
 
-탐색·선정을 건너뛰고 받은 장소를 그대로 쓰는지, 그래서 LLM 호출이 초기
-추천보다 한 번 적은지, 장소 목록이 없으면 실패로 끝나는지를 본다.
+선택 장소의 출처를 확인하고 받은 순서를 유지하면서 LLM 호출 없이
+동선과 시간표를 계산하는지, 장소 목록이 없으면 실패로 끝나는지를 본다.
 """
 from __future__ import annotations
 
@@ -281,14 +281,14 @@ def test_load_given_places_noop_on_error() -> None:
 # ── 그래프 통합 ────────────────────────────────────────────────
 
 def test_route_stage_skips_search_and_selection() -> None:
-    """장소 탐색을 부르지 않고 LLM 은 동선·이유 2회만 쓴다."""
+    """선택 장소의 출처 확인은 유지하고 생성형 추천/설명은 호출하지 않는다."""
     hub = _FakeHub()
-    gemini = _SeqGemini([_reason_envelope(2)])
+    gemini = _SeqGemini([])
 
     out, pub = _invoke(_request(), hub, gemini)
 
     assert hub.search_calls == 2
-    assert gemini.calls == 1
+    assert gemini.calls == 0
     assert out.get("error") is None
     payload = pub.payloads[0]
     assert payload["status"] == "done"
@@ -297,22 +297,23 @@ def test_route_stage_skips_search_and_selection() -> None:
     ]
     assert payload["visit_order"] == [0, 1]
     assert len(payload["legs"]) == 1
-    # 추천 이유는 초기 추천과 같은 방식으로 붙는다. 블로그 요약은 이 경로에
-    # 실리지 않는다 — 장소를 눌렀을 때 별도 파이프라인이 만든다.
-    assert payload["places"][0]["reason"] == "이유0"
+    # A user-selected place has no newly generated recommendation reason.
+    assert payload["places"][0]["reason"] is None
     assert payload["places"][0]["bullets"] is None
 
 
-def test_route_stage_stays_within_llm_budget() -> None:
-    """route 경로의 LLM 소비는 예산 상한보다 작다(동선·이유 2회)."""
-    from app.agent_settings import get_settings
-
+@pytest.mark.parametrize("optimize", [False, True])
+@pytest.mark.parametrize("mobility", list(Mobility))
+def test_route_stage_does_not_consume_llm_budget(optimize, mobility) -> None:
+    """수동/최적화·이동수단에 관계없이 유료 LLM 호출 없이 완료한다."""
     hub = _FakeHub()
-    gemini = _SeqGemini([_reason_envelope(2)])
-    out, _ = _invoke(_request(), hub, gemini)
-
-    assert out["llm_calls_used"] == 1
-    assert out["llm_calls_used"] <= get_settings().GEMINI_MAX_CALLS_PER_REQUEST
+    gemini = _SeqGemini([])
+    out, pub = _invoke(_request(optimize=optimize, mobility=mobility), hub, gemini)
+    assert out.get("llm_calls_used", 0) == 0
+    assert gemini.calls == 0
+    assert pub.payloads[0]["status"] == "done"
+    assert pub.payloads[0].get("clothing") is None
+    assert out.get("degraded_reason") is None
 
 
 def test_init_stage_still_searches() -> None:

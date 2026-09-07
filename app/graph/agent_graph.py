@@ -10,13 +10,13 @@
   -> rules_filter -> score_and_rank      (hub /v1/rules/*)
   -> recommend_places -> recommend_route
   -> build_timeline -> fit_time_budget   (hub /v1/rules/estimate/dwell)
-  -> llm_reason                          (정상 경로 한정, 실패 시 degrade)
+  -> llm_reason                          (초기 추천·재탐색 정상 경로만)
   -> build_payload -> publish_done
 
 시간축:
   build_timeline 이 체류시간과 방문 시각을 계산하고, 하루 활동 시간을
   넘긴 일차가 있으면 fit_time_budget 이 결정적으로 줄인다. 두 노드 모두
-  LLM 을 쓰지 않으며 실패해도 error 를 세우지 않는다.
+  LLM 을 쓰지 않으며 충족할 수 없는 시간표는 실패로 표시한다.
 
 블로그 후기 요약은 이 그래프에 없다. 요약은 일정에 딸려 나오는 값이 아니라
 장소를 눌렀을 때 필요한 정보이므로 별도 파이프라인
@@ -25,11 +25,11 @@
 stage="route" 분기:
   사용자가 방문지를 이미 골라 온 요청은 탐색·선정 구간이 통째로 불필요하다.
   fetch_weather 다음에서 갈라져 load_given_places 로 장소를 세운 뒤 곧장
-  recommend_route 에 합류한다(이후 구간은 공용). 전략도 탐색도 필요 없으므로
-  LLM 호출은 이유 1회뿐이다.
+  recommend_route 에 합류한다. 시간표 계산 후 생성 설명을 건너뛰고
+  build_payload 로 간다. 수동 경로와 명시적 optimize의 LLM 호출은 0회다.
 
 LLM 호출:
-  선정 1 + 이유 1 = 2회다. 방문 순서와 구간은 recommend_route 가 좌표로
+  초기 추천·재탐색은 선정 1 + 이유 1 = 2회다. 방문 순서와 구간은 recommend_route 가 좌표로
   계산하므로 모델을 부르지 않는다. 요청당 상한 3 에서 1회가 남아, 앞 단계가
   형식을 한 번 어겨도 교정 재시도로 복구할 수 있다.
 
@@ -87,6 +87,13 @@ def _route_after_weather(state: AgentState) -> str:
     if state["request"].stage == "route":
         return "load_given_places"
     return "plan_strategy"
+
+
+def _route_after_time_budget(state: AgentState) -> str:
+    """Selected-place routes need geometry and a timetable, not generated recommendations."""
+    if state.get("error") or state["request"].stage == "route":
+        return "build_payload"
+    return "llm_reason"
 
 
 def build_graph(checkpointer=None):
@@ -162,10 +169,14 @@ def build_graph(checkpointer=None):
             "build_payload": "build_payload",
         },
     )
-    # 두 시간축 노드는 실패해도 error 를 세우지 않는다(계산을 생략하고
-    # 표시만 남긴다). 그래서 뒤가 단순 엣지다 — 룰 노드와 같은 계약이다.
+    # Time overflow is checked before choosing the optional explanation branch.
     graph.add_edge("build_timeline", "fit_time_budget")
-    graph.add_edge("fit_time_budget", "llm_reason")
+    # Manual routing and explicit optimization are deterministic. Do not send
+    # selected places or trip context to Gemini merely to explain that route.
+    graph.add_conditional_edges(
+        "fit_time_budget", _route_after_time_budget,
+        {"llm_reason": "llm_reason", "build_payload": "build_payload"},
+    )
     # llm_reason 은 실패해도 error 를 세우지 않고 저하 표시만 남기므로
     # 단순 엣지로 합류 지점까지 직진한다.
     graph.add_edge("llm_reason", "build_payload")
