@@ -289,7 +289,7 @@ class AgentSettings(BaseSettings):
     POSTGRES_HOST: str = "postgres"
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "map"
-    POSTGRES_USER: str = "map"
+    POSTGRES_USER: str = "map_agent_runtime"
     POSTGRES_PASSWORD: SecretStr = SecretStr("")
     LANGGRAPH_SCHEMA: str = "langgraph"
     # 체크포인트 봉인 열쇠. "kid:base64" 를 쉼표로 이어 여러 개를 두고
