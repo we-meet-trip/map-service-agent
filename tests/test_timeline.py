@@ -184,6 +184,26 @@ def test_dropping_keeps_leg_count_contract() -> None:
         assert leg.to_place_id == order[i + 1]
 
 
+def test_budget_trimming_preserves_pins_after_route_reorders_them_last() -> None:
+    places = [_place(i).model_copy(update={"lat": 37.5, "lng": 127.0}) for i in range(4)]
+    state = _state(places, [_leg(0, 1, 10), _leg(1, 2, 10), _leg(2, 3, 10)], _request(end_hour=10))
+    state["pinned_content_ids"] = ["c0", "c3"]
+    out = _run(state, _FakeHub(60))
+    assert out.get("error") is None
+    assert {"c0", "c3"} <= {p.content_id for p in out["places"]}
+    assert len(out["places"]) < 4
+    assert len(out["legs"]) == len(out["places"]) - 1
+
+
+def test_impossible_pins_fail_without_removing_any_pin() -> None:
+    places = [_place(i) for i in range(3)]
+    state = _state(places, [_leg(0, 1, 30), _leg(1, 2, 30)], _request(end_hour=10))
+    state["pinned_content_ids"] = [p.content_id for p in places]
+    out = _run(state, _FakeHub(60))
+    assert out.get("error") == "verified places exceed the activity time budget"
+    assert [p.content_id for p in out["places"]] == ["c0", "c1", "c2"]
+
+
 def test_hub_failure_degrades_without_error() -> None:
     """hub 가 죽어도 잡을 세우지 않고 표시만 남긴다."""
     places = [_place(0), _place(1)]

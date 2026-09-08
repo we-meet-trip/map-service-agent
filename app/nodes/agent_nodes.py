@@ -571,6 +571,7 @@ class AgentState(TypedDict):
     reviews: NotRequired[dict[str, list[str]]]
     reviews_fetch_used: NotRequired[int]
     places: NotRequired[list[Place]]
+    pinned_content_ids: NotRequired[list[str]]
     visit_order: NotRequired[list[int]]
     legs: NotRequired[list[Leg]]
     llm_calls_used: NotRequired[int]
@@ -1394,6 +1395,8 @@ async def recommend_places(state: AgentState) -> AgentState:
         pinned = await _verify_selected_places(state, state["request"].places)
         if state.get("error"):
             return state
+    # Canonical source IDs survive route reordering and place_id renumbering.
+    state["pinned_content_ids"] = [p.content_id for p in pinned if p.content_id]
     if pinned and not _remaining_targets(state, pinned):
         # 남길 장소가 그날 몫을 전부 채웠다. 더 뽑을 자리가 없다.
         state["places"] = pinned
@@ -2193,7 +2196,10 @@ async def fit_time_budget(state: AgentState) -> AgentState:
         return state
 
     # 수동으로 정한 방문지를 시간에 맞춘다는 이유로 몰래 삭제하지 않는다.
-    if state["request"].stage == "route":
+    request = state["request"]
+    if request.stage == "route" or (
+        request.stage == "mode1" and request.places and "pinned_content_ids" not in state
+    ):
         state["timeline_status"] = "unverified"
         state["error"] = "selected places exceed the activity time budget"
         return state
@@ -2206,6 +2212,7 @@ async def fit_time_budget(state: AgentState) -> AgentState:
     }
     order = list(state.get("visit_order") or [])
     by_id = {p.place_id: p for p in places}
+    pinned_ids = set(state.get("pinned_content_ids") or [])
 
     # hub 룰과 같은 하한을 쓴다. 값이 어긋나면 여기서 줄인 결과가 룰이
     # 허용하지 않는 체류시간이 된다.
@@ -2231,7 +2238,11 @@ async def fit_time_budget(state: AgentState) -> AgentState:
                 break
             if len(day_order) <= keep_min:
                 break
-            removed = day_order.pop()
+            removed = next((pid for pid in reversed(day_order)
+                            if by_id[pid].content_id not in pinned_ids), None)
+            if removed is None:
+                break
+            day_order.remove(removed)
             dropped.add(removed)
         del trial_timeline
 
