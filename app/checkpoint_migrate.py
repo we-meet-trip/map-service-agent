@@ -52,8 +52,11 @@ def main() -> int:
         return 1
     try:
         asyncio.run(migrate(dsn, os.environ.get("LANGGRAPH_SCHEMA", "langgraph")))
-    except Exception:
-        print("Agent checkpoint migration failed; preserve database for operator recovery", file=sys.stderr)
+    except Exception as error:
+        import re
+        state = getattr(error, "sqlstate", None)
+        safe_state = state if isinstance(state, str) and re.fullmatch(r"[A-Z0-9]{5}", state) else "unknown"
+        print(f"Agent checkpoint migration failed; error_class={type(error).__name__}; sqlstate={safe_state}", file=sys.stderr)
         return 1
     print("Agent checkpoint migration completed")
     return 0
