@@ -251,7 +251,7 @@ class HubClient:
     async def score_indoor_bonus(
         self,
         pois: list[dict],
-        day_pop_max: int,
+        day_pop_max: int | None,
     ) -> dict:
         """hub `POST /v1/rules/score/indoor-bonus` 로 실내 보너스 점수를 받는다.
 

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.nodes.agent_nodes import (
     _AFFINITY_MAX,
     _segment_gain,
@@ -78,6 +80,21 @@ class TestBuild:
 
 
 class TestGain:
+    @pytest.mark.parametrize("rate", [None, True, False, [], {}, "invalid",
+                                      float("nan"), float("inf"), -float("inf"),
+                                      "NaN", "Infinity", -0.01, 1.01, 10 ** 400])
+    def test_invalid_rate_adds_no_score(self, rate):
+        assert _segment_gain({"content_id": "a"}, {"places": {"a": {"rate": rate}}}) == 0.0
+
+    @pytest.mark.parametrize("rate", [0, 0.25, 1, "0.75"])
+    def test_valid_rate_keeps_existing_score(self, rate):
+        assert _segment_gain({"content_id": "a"}, {"places": {"a": {"rate": rate}}}) == _AFFINITY_MAX * float(rate)
+
+    @pytest.mark.parametrize("segment", [[], "bad", 1, {"places": []},
+                                          {"places": {"a": []}}, {"places": {"a": "bad"}}])
+    def test_invalid_nested_shape_adds_no_score(self, segment):
+        assert _segment_gain({"content_id": "a"}, segment) == 0.0
+
     def test_통계에_있는_곳만_가점을_받는다(self):
         segment = {"places": {"a": {"shown": 5, "saved": 5, "rate": 1.0}}}
 
@@ -118,3 +135,73 @@ class TestCombination:
         assert seg_gain > 0
         assert combined <= _AFFINITY_MAX
         assert theme_gain + seg_gain > _AFFINITY_MAX  # 합했다면 넘었을 것이다
+
+
+class TestLoading:
+    @pytest.fixture(autouse=True)
+    def isolated_cache(self, monkeypatch):
+        from app.nodes import agent_nodes
+        monkeypatch.setattr(agent_nodes, "_SEGMENT_STATS", None)
+        monkeypatch.setattr(agent_nodes, "_SEGMENT_STATS_LOADED", False)
+
+    @pytest.mark.parametrize("stats", [None, [], [1], "bad", 1,
+        {"segments": []}, {"segments": None}, {"segments": {"unknown|unknown": []}},
+        {"segments": {"unknown|unknown": {"places": []}}},
+        {"segments": {"unknown|unknown": {"places": {"a": []}}}}])
+    def test_malformed_artifact_is_cached_as_empty(self, tmp_path, monkeypatch, stats):
+        from types import SimpleNamespace
+        from app.nodes import agent_nodes
+        path = tmp_path / "stats.json"
+        path.write_text(json.dumps(stats))
+        monkeypatch.setattr(agent_nodes, "get_settings", lambda: SimpleNamespace(SEGMENT_STATS_PATH=str(path)))
+        assert agent_nodes._segment_stats() == {}
+        assert agent_nodes._segment_for(None, None) is None
+        assert agent_nodes._segment_stats() == {}
+
+    def test_valid_artifact_is_unchanged_and_loaded_once(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from app.nodes import agent_nodes
+        stats = build([_row("unknown", "unknown", [_cand("a", True)])] * 3, min_support=3)
+        path = tmp_path / "stats.json"
+        path.write_text(json.dumps(stats))
+        monkeypatch.setattr(agent_nodes, "get_settings", lambda: SimpleNamespace(SEGMENT_STATS_PATH=str(path)))
+        assert agent_nodes._segment_stats() == stats
+        assert _segment_gain({"content_id": "a"}, agent_nodes._segment_for(None, None)) == _AFFINITY_MAX
+        path.write_text("[]")
+        assert agent_nodes._segment_stats() == stats
+
+    @pytest.mark.parametrize("raw", [b"{broken", b"\xff", b"[" * 2000 + b"0" + b"]" * 2000])
+    def test_unreadable_or_excessively_nested_json_is_ignored(self, tmp_path, monkeypatch, raw):
+        from types import SimpleNamespace
+        from app.nodes import agent_nodes
+        path = tmp_path / "stats.json"
+        path.write_bytes(raw)
+        monkeypatch.setattr(agent_nodes, "get_settings", lambda: SimpleNamespace(SEGMENT_STATS_PATH=str(path)))
+        assert agent_nodes._segment_stats() == {}
+        assert agent_nodes._segment_for(None, None) is None
+
+    @pytest.mark.parametrize("stats", [[], {"segments": {"unknown|unknown": {
+        "places": {"a": {"rate": float("nan")}, "b": {"rate": 100}}}}}])
+    def test_bad_artifact_does_not_break_or_reorder_recommendation(self, tmp_path, monkeypatch, stats):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from app import agent_dependencies
+        from app.nodes import agent_nodes
+
+        path = tmp_path / "stats.json"
+        path.write_text(json.dumps(stats))
+        monkeypatch.setattr(agent_nodes, "get_settings", lambda: SimpleNamespace(
+            SEGMENT_STATS_PATH=str(path), RULES_ENABLED=True, PERSONALIZATION_ENABLED=True))
+        monkeypatch.setattr(agent_nodes, "_emit_stage", AsyncMock())
+
+        async def score(pois, day_pop_max):
+            assert [p["base_score"] for p in pois] == [1.0, 0.99]
+            return {"scored": [{"content_id": p["content_id"], "score": p["base_score"]} for p in pois]}
+
+        monkeypatch.setattr(agent_dependencies, "get_hub_client", lambda: SimpleNamespace(score_indoor_bonus=score))
+        state = {"request": SimpleNamespace(theme=[]), "grounded": True,
+                 "candidates": [{"content_id": "a"}, {"content_id": "b"}]}
+        result = asyncio.run(agent_nodes.score_and_rank(state))
+        assert not result.get("error")
+        assert [c["content_id"] for c in result["candidates"]] == ["a", "b"]

@@ -219,13 +219,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from psycopg_pool import AsyncConnectionPool
 
         from app.crypto.checkpoint_seal import build_cipher
+        from app.checkpoint_db import checkpoint_schema, validate_runtime_schema
 
-        schema = settings.LANGGRAPH_SCHEMA
-        if not schema.isidentifier():
-            raise RuntimeError(
-                f"invalid LANGGRAPH_SCHEMA identifier: {schema!r}"
-            )
         try:
+            schema = checkpoint_schema(settings.LANGGRAPH_SCHEMA)
             conninfo = _checkpoint_conninfo(settings)
             # 체크포인트에 실리는 대화 상태에는 좌표가 담긴다. 저장 전에
             # 봉하도록 serde 를 갈아 끼우고, 봉인 열쇠가 없거나 잘못돼
@@ -259,11 +256,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             await checkpoint_pool.open()
             async with checkpoint_pool.connection() as conn:
-                await conn.execute(
-                    f"CREATE SCHEMA IF NOT EXISTS {schema}"
-                )
+                await validate_runtime_schema(conn, schema)
             checkpointer = AsyncPostgresSaver(checkpoint_pool, serde=serde)
-            await checkpointer.setup()
             logger.info(
                 "agent: langgraph checkpointer ready schema=%s", schema
             )
@@ -279,8 +273,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await limiter.aclose()
             reset_all()
             raise RuntimeError(
-                "langgraph checkpointer init failed (set "
-                "CHECKPOINT_ENABLED=false to boot without it)"
+                "langgraph checkpointer init failed; run the isolated migration job "
+                "and verify runtime role/schema/encryption configuration"
             ) from None
 
     app.state.checkpoint_pool = checkpoint_pool
