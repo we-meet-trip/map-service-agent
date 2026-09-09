@@ -180,7 +180,8 @@ def test_parse_error_short_circuits_no_llm() -> None:
     assert gemini.calls == 0
     payload = pub.payloads[0]
     assert payload["status"] == "failed"
-    assert "date_start" in payload["error"]
+    assert payload["code"] == "invalid_request"
+    assert payload["retryable"] is False
 
 
 def test_route_is_computed_not_asked() -> None:

@@ -118,6 +118,8 @@ GOLDEN: dict[str, dict[str, str]] = {
         "timeline_status": "Optional[Literal[ok,trimmed,unverified]]|opt",
         "warnings": "Optional[list[str]]|opt",
         "error": "Optional[str]|opt",
+        "code": "Optional[str]|opt",
+        "retryable": "Optional[bool]|opt",
     },
     # JobDonePayload.places[] 중첩
     "Place": {

@@ -47,6 +47,7 @@ from app.agent_dependencies import (
     set_streams_publisher,
 )
 from app.crypto import location_seal
+from app.errors import exception_failure, failure
 from app.agent_settings import get_settings
 from app.clients.agent_clients import (
     GeminiClient,
@@ -423,12 +424,13 @@ async def health_ready() -> JSONResponse:
     )
 
 
-async def _publish_failure(job_id: str, error: str) -> None:
+async def _publish_failure(job_id: str, error: str, *, code: str = "generation_failed", retryable: bool = False) -> None:
     """잡 실패 페이로드를 Redis Streams 에 게시.
 
     인자:
       job_id: 실패한 잡의 식별자.
-      error: 실패 사유 텍스트. `JobDonePayload.error` 로 직렬화된다.
+      error: 이전 호출 계약용 인자. 원문은 직렬화하지 않는다.
+      code/retryable: 고정 실패 분류와 동일 조건 재요청 가능 여부.
 
     동작:
       `agent_dependencies.get_streams_publisher()` 로 StreamsPublisher 를
@@ -442,7 +444,7 @@ async def _publish_failure(job_id: str, error: str) -> None:
     try:
         publisher = get_streams_publisher()
         payload = JobDonePayload(
-            job_id=job_id, status="failed", error=error
+            job_id=job_id, status="failed", **failure(code, retryable)
         )
         await publisher.publish(
             job_id=job_id,
@@ -495,15 +497,15 @@ async def _run_job(
         )
         await _publish_failure(
             job_id,
-            f"job timeout after {timeout_seconds:.0f} seconds",
+            "generation_timeout", code="generation_timeout", retryable=True,
         )
     except asyncio.CancelledError:
         logger.warning("agent job cancelled job_id=%s", job_id)
-        await _publish_failure(job_id, "job cancelled on shutdown")
+        await _publish_failure(job_id, "upstream_unavailable", code="upstream_unavailable", retryable=True)
         raise
     except Exception as e:  # noqa: BLE001
-        logger.exception("agent job failed job_id=%s", job_id)
-        await _publish_failure(job_id, str(e))
+        logger.warning("agent job failed job_id=%s cause=%s", job_id, type(e).__name__)
+        await _publish_failure(job_id, **exception_failure(e))
 
 
 def _resolve_places(req: AgentRequest) -> AgentRequest:

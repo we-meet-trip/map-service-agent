@@ -31,6 +31,7 @@ from pydantic import ValidationError
 from typing_extensions import NotRequired
 
 from app.agent_settings import get_settings
+from app.errors import exception_failure, failure
 from app.llm.prompt_json import dump_prompt_json
 from app.llm.structured_call import call_structured
 from app.security.sanitize import (
@@ -598,6 +599,8 @@ class AgentState(TypedDict):
     # 그것을 실제로 쓴 경로를 모르면 목록의 의미가 정해지지 않는다.
     selection_path: NotRequired[str]
     error: NotRequired[str]
+    code: NotRequired[str]
+    retryable: NotRequired[bool]
 
 
 async def _emit_stage(state: AgentState, stage: str) -> None:
@@ -642,27 +645,41 @@ async def parse_input(state: AgentState) -> AgentState:
     d = req.date
     if d.date_start > d.date_end:
         state["error"] = "date_start must be <= date_end"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     if (d.date_end - d.date_start) > timedelta(days=_MAX_RANGE_DAYS):
         state["error"] = f"date range must be <= {_MAX_RANGE_DAYS} days"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     if d.time_start >= d.time_end:
         state["error"] = "time_start must be < time_end"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     if req.places and any(p.day > _num_days(req) for p in req.places):
         state["error"] = "selected place day exceeds the date range"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     if req.stage == "route" and req.places:
         days = [p.day for p in req.places]
         if days != sorted(days):
             state["error"] = "selected places must be in day order"
+            state["code"] = "invalid_request"
+            state["retryable"] = False
             return state
     if req.stage == "route":
         if not req.places:
             state["error"] = "stage=route requires places"
+            state["code"] = "invalid_request"
+            state["retryable"] = False
             return state
         if len(req.places) < 2:
             state["error"] = "stage=route requires at least 2 places"
+            state["code"] = "invalid_request"
+            state["retryable"] = False
             return state
     return state
 
@@ -681,6 +698,8 @@ async def load_given_places(state: AgentState) -> AgentState:
     selected = req.places or []
     if not selected:
         state["error"] = "stage=route requires places"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     # 사용자가 직접 고른 경로다. 후보 목록도 랭킹도 거치지 않으므로 학습에서
     # 다른 경로와 같이 묶으면 안 된다.
@@ -720,10 +739,12 @@ async def _verify_selected_places(
                     break
             if match is None:
                 state["error"] = "selected place could not be verified with its source"
+                state["code"] = "invalid_request"
+                state["retryable"] = False
                 return []
             verified.append(match)
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError, RuntimeError):
-        state["error"] = "selected places verification unavailable"
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+        state.update(exception_failure(exc))
         return []
     return verified
 
@@ -968,10 +989,9 @@ async def search_places(state: AgentState) -> AgentState:
       이동수단은 코스 후보를 걷기/자전거로 거르는 데, 테마는 검색어로
       전달한다.
 
-    저하 처리(하드 실패 아님):
-      호출이 실패하거나 후보가 비면 `state["error"]` 를 세우지 않고
-      `state["grounded"]=False`, `state["candidates"]=[]` 로 둔다. 그러면
-      다음 노드가 LLM 단독 생성으로 폴백하되 결과를 저신뢰로 표시한다.
+    호출 실패는 안전한 실패 코드로 종료한다. 정상 응답의 빈 후보는
+    다음 선정 노드에서 no_matching_places로 구분한다. 장소를 창작하거나
+    요청 지역·테마를 확대하지 않는다.
 
     호출처: LangGraph(fetch_weather 다음).
     """
@@ -999,17 +1019,23 @@ async def search_places(state: AgentState) -> AgentState:
     except (httpx.HTTPError, ValueError) as e:
         # 전송 실패뿐 아니라 200 응답이 JSON 으로 디코드되지 않는 경우
         # (json 디코드 오류는 ValueError 하위)도 저하로 흡수한다.
-        logger.warning("search_places degraded: %s", type(e).__name__)
+        logger.warning("search_places failed: %s", type(e).__name__)
+        state.update(exception_failure(e))
+        if state["code"] == "generation_failed":
+            state.update(failure("upstream_unavailable"))
+        state["candidates"] = []
+        state["grounded"] = False
+        return state
+    if any(not isinstance(result, dict) or not isinstance(result.get("places"), list) for result in results):
+        state.update(failure("upstream_unavailable"))
         state["candidates"] = []
         state["grounded"] = False
         return state
     candidates = _merge_place_results(results)
     # Mode 1 재탐색(stage="mode1")의 exclude 반영: 직전 추천 장소의
     # content_id 를 후보에서 제거한다(재탐색 제외 목록). content_id
-    # 가 없는 후보는 대조 불가라 통과시킨다. 전량 제외되면 아래의 기존
-    # 저하 규칙(grounded=False → invent 폴백)을 그대로 탄다.
-    # 한계: invent 폴백은 LLM 창작 장소라 content_id 기반 exclude 를
-    # 적용할 수 없다(후속 결정 대상 — B2 amendment 문서 참조).
+    # 가 없는 후보는 대조 불가라 통과시킨다. 전량 제외되면 요청 조건을
+    # 바꾸지 않고 다음 선정 노드에서 no_matching_places로 종료한다.
     exclude = set(req.exclude or [])
     if exclude:
         candidates = [
@@ -1409,6 +1435,8 @@ async def recommend_places(state: AgentState) -> AgentState:
         state = await _select_places(state, candidates)
     else:
         state["error"] = "insufficient verified places: no search candidates"
+        state["code"] = "no_matching_places"
+        state["retryable"] = False
     if pinned and not state.get("error"):
         state["places"] = _merge_pinned(pinned, state.get("places") or [])
     if not state.get("error"):
@@ -1418,6 +1446,8 @@ async def recommend_places(state: AgentState) -> AgentState:
             for day in range(1, _num_days(state["request"]) + 1)
         ):
             state["error"] = "insufficient verified places for the requested days"
+            state["code"] = "selection_invalid"
+            state["retryable"] = False
     return state
 
 
@@ -1700,10 +1730,10 @@ async def _select_places(
         )
     except Exception as e:
         logger.warning(
-            "recommend_places(select) failed job_id=%s err=%s: %s",
-            state.get("job_id"), type(e).__name__, e,
+            "recommend_places(select) failed job_id=%s cause=%s",
+            state.get("job_id"), type(e).__name__,
         )
-        state["error"] = f"recommend_places failed: {e}"
+        state.update(exception_failure(e))
         return state
 
     # 일차 범위를 벗어난 선택은 잡을 죽이지 않고 건너뛴다 — 이 경로는
@@ -1754,6 +1784,8 @@ async def _select_places(
             len(envelope.selections), len(chosen),
         )
         state["error"] = "insufficient verified places: selection returned empty"
+        state["code"] = "selection_invalid"
+        state["retryable"] = False
         return state
     state["places"] = places
     return state
@@ -1790,6 +1822,8 @@ async def recommend_route(state: AgentState) -> AgentState:
     places = state["places"]
     if not places:
         state["error"] = "recommend_route has no places"
+        state["code"] = "selection_invalid"
+        state["retryable"] = False
         return state
 
     req = state["request"]
@@ -2202,6 +2236,8 @@ async def fit_time_budget(state: AgentState) -> AgentState:
     ):
         state["timeline_status"] = "unverified"
         state["error"] = "selected places exceed the activity time budget"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
 
     places = state.get("places") or []
@@ -2257,6 +2293,8 @@ async def fit_time_budget(state: AgentState) -> AgentState:
         state["timeline_status"] = "unverified"
         state["timeline_overflow_days"] = still_overflowed
         state["error"] = "verified places exceed the activity time budget"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     for pid, slot in timeline.items():
         old = (state.get("timeline") or {}).get(pid) or {}
@@ -2539,7 +2577,8 @@ async def publish_done(state: AgentState) -> AgentState:
             job_id, state["error"], state.get("degraded_reason"),
         )
         payload = JobDonePayload(
-            job_id=job_id, status="failed", error=state["error"]
+            job_id=job_id, status="failed",
+            **failure(state.get("code", "generation_failed"), state.get("retryable", False))
         )
     else:
         warnings = state.get("warnings") or None
