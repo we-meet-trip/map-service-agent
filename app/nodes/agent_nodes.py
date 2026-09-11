@@ -31,6 +31,7 @@ from pydantic import ValidationError
 from typing_extensions import NotRequired
 
 from app.agent_settings import get_settings
+from app.errors import exception_failure, failure
 from app.llm.prompt_json import dump_prompt_json
 from app.llm.structured_call import call_structured
 from app.security.sanitize import (
@@ -305,10 +306,23 @@ def _segment_stats() -> dict:
         return {}
     try:
         with open(path, encoding="utf-8") as f:
-            _SEGMENT_STATS = json.load(f)
-        segments = (_SEGMENT_STATS or {}).get("segments") or {}
+            stats = json.load(f)
+        if not isinstance(stats, dict):
+            raise ValueError("invalid segment stats object")
+        segments = stats.get("segments", {})
+        if not isinstance(segments, dict):
+            raise ValueError("invalid segments object")
+        for segment in segments.values():
+            if not isinstance(segment, dict):
+                raise ValueError("invalid segment object")
+            places = segment.get("places", {})
+            if not isinstance(places, dict) or any(
+                not isinstance(entry, dict) for entry in places.values()
+            ):
+                raise ValueError("invalid segment places object")
+        _SEGMENT_STATS = stats
         logger.info("segment stats loaded segments=%d path=%s", len(segments), path)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         # 통계를 못 읽는 것이 추천을 막아서는 안 된다. 없는 것으로 친다.
         logger.warning("segment stats load failed path=%s reason=%s",
                        path, type(e).__name__)
@@ -322,15 +336,27 @@ def _segment_gain(candidate: dict, segment: dict | None) -> float:
     문턱을 못 넘어 통계에 없는 곳은 0 이다. 한두 번의 우연을 취향으로 굳히지
     않으려는 것이고, 그 판정은 통계를 만드는 쪽에서 이미 끝났다.
     """
-    if not segment:
+    if not isinstance(segment, dict):
         return 0.0
     cid = candidate.get("content_id")
     if not cid:
         return 0.0
-    entry = (segment.get("places") or {}).get(cid)
-    if not entry:
+    places = segment.get("places")
+    if not isinstance(places, dict):
         return 0.0
-    return _AFFINITY_MAX * float(entry.get("rate") or 0.0)
+    entry = places.get(cid)
+    if not isinstance(entry, dict):
+        return 0.0
+    raw_rate = entry.get("rate")
+    if isinstance(raw_rate, bool):
+        return 0.0
+    try:
+        rate = float(raw_rate)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+        return 0.0
+    return _AFFINITY_MAX * rate
 
 
 def _segment_for(age_band: str | None, gender: str | None) -> dict | None:
@@ -467,7 +493,9 @@ def _weather_brief(weather) -> dict:
         for key, bucket in (("temp_min", lows), ("temp_max", highs),
                             ("precipitation_prob", pops)):
             v = d.get(key)
-            if isinstance(v, (int, float)):
+            if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and math.isfinite(v) and -900 < v < 900
+                    and (key != "precipitation_prob" or 0 <= v <= 100)):
                 bucket.append(int(v))
         sky = d.get("sky_condition")
         if isinstance(sky, str) and sky and sky not in skies:
@@ -544,6 +572,7 @@ class AgentState(TypedDict):
     reviews: NotRequired[dict[str, list[str]]]
     reviews_fetch_used: NotRequired[int]
     places: NotRequired[list[Place]]
+    pinned_content_ids: NotRequired[list[str]]
     visit_order: NotRequired[list[int]]
     legs: NotRequired[list[Leg]]
     llm_calls_used: NotRequired[int]
@@ -570,6 +599,8 @@ class AgentState(TypedDict):
     # 그것을 실제로 쓴 경로를 모르면 목록의 의미가 정해지지 않는다.
     selection_path: NotRequired[str]
     error: NotRequired[str]
+    code: NotRequired[str]
+    retryable: NotRequired[bool]
 
 
 async def _emit_stage(state: AgentState, stage: str) -> None:
@@ -614,27 +645,41 @@ async def parse_input(state: AgentState) -> AgentState:
     d = req.date
     if d.date_start > d.date_end:
         state["error"] = "date_start must be <= date_end"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     if (d.date_end - d.date_start) > timedelta(days=_MAX_RANGE_DAYS):
         state["error"] = f"date range must be <= {_MAX_RANGE_DAYS} days"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     if d.time_start >= d.time_end:
         state["error"] = "time_start must be < time_end"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     if req.places and any(p.day > _num_days(req) for p in req.places):
         state["error"] = "selected place day exceeds the date range"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     if req.stage == "route" and req.places:
         days = [p.day for p in req.places]
         if days != sorted(days):
             state["error"] = "selected places must be in day order"
+            state["code"] = "invalid_request"
+            state["retryable"] = False
             return state
     if req.stage == "route":
         if not req.places:
             state["error"] = "stage=route requires places"
+            state["code"] = "invalid_request"
+            state["retryable"] = False
             return state
         if len(req.places) < 2:
             state["error"] = "stage=route requires at least 2 places"
+            state["code"] = "invalid_request"
+            state["retryable"] = False
             return state
     return state
 
@@ -653,6 +698,8 @@ async def load_given_places(state: AgentState) -> AgentState:
     selected = req.places or []
     if not selected:
         state["error"] = "stage=route requires places"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     # 사용자가 직접 고른 경로다. 후보 목록도 랭킹도 거치지 않으므로 학습에서
     # 다른 경로와 같이 묶으면 안 된다.
@@ -692,10 +739,12 @@ async def _verify_selected_places(
                     break
             if match is None:
                 state["error"] = "selected place could not be verified with its source"
+                state["code"] = "invalid_request"
+                state["retryable"] = False
                 return []
             verified.append(match)
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError, RuntimeError):
-        state["error"] = "selected places verification unavailable"
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+        state.update(exception_failure(exc))
         return []
     return verified
 
@@ -759,14 +808,13 @@ async def fetch_weather(state: AgentState) -> AgentState:
             req.date.date_end,
         )
     except httpx.HTTPStatusError as e:
-        logger.warning(
-            "hub /v1/weather %s: %s",
-            e.response.status_code, e.response.text[:200],
-        )
+        logger.warning("hub /v1/weather HTTP_%s", e.response.status_code)
+        state.pop("weather", None)
         _add_warning(state, _WARN_WEATHER_UNAVAILABLE)
         return state
     except httpx.HTTPError as e:
         logger.warning("hub /v1/weather unreachable: %s", type(e).__name__)
+        state.pop("weather", None)
         _add_warning(state, _WARN_WEATHER_UNAVAILABLE)
         return state
     state["weather"] = weather
@@ -803,7 +851,7 @@ def _warn_missing_forecast_days(
         _add_warning(
             state,
             f"{', '.join(sorted(hit))} 는 날씨 예보를 확인하지 못해 "
-            "강수확률 0 으로 계산했습니다",
+            "해당 날짜에 날씨 조건을 반영하지 못했습니다",
         )
 
 
@@ -856,15 +904,15 @@ async def plan_strategy(state: AgentState) -> AgentState:
     return state
 
 
-def _daily_pops(weather, date_start: date, num_days: int) -> list[int]:
+def _daily_pops(weather, date_start: date, num_days: int) -> list[int | None]:
     """일차별 강수확률(%)을 여행 일수만큼 뽑는다.
 
     날짜로 맞춘다. 배열 위치로 세면 안 되는 이유가 있다 — hub 는 예보를
     구하지 못한 날을 목록에서 빼고 보낸다. 그러면 첫날 자리에 며칠 뒤 값이
     들어와, 맑은 날을 비 오는 날로 보고 실내로 몰거나 그 반대가 된다.
 
-    값이 없는 날은 0 으로 둔다. 모르는 날을 비 온다고 가정하면 근거 없이
-    실내로 몰리므로, 모를 때는 아무 편향도 주지 않는 쪽을 택한다.
+    값이 없는 날은 None이다. 날씨 가중치를 적용하지 않는다는 사실과
+    공급자가 강수확률 0%를 예보했다는 사실을 구분한다.
     """
     by_date: dict[str, int] = {}
     if isinstance(weather, dict):
@@ -873,10 +921,11 @@ def _daily_pops(weather, date_start: date, num_days: int) -> list[int]:
                 continue
             key = str(d.get("date") or "")
             value = d.get("precipitation_prob")
-            if key and isinstance(value, (int, float)):
+            if (key and isinstance(value, (int, float))
+                    and not isinstance(value, bool) and 0 <= value <= 100):
                 by_date[key] = int(value)
     return [
-        by_date.get((date_start + timedelta(days=i)).isoformat(), 0)
+        by_date.get((date_start + timedelta(days=i)).isoformat())
         for i in range(num_days)
     ]
 
@@ -899,13 +948,15 @@ def _target_stops(active_minutes: int) -> int:
     return max(_STOPS_MIN, min(_STOPS_MAX, fits))
 
 
-def _indoor_ratio(pop: int) -> float:
+def _indoor_ratio(pop: int | None) -> float:
     """그날 강수확률로 실내 비중을 정한다.
 
     hub 실내 가점이 50% 를 임계로 쓰므로 같은 기준을 따른다. 비가 확실할수록
     실내를 늘리되, 전부 실내로 채우지는 않는다 — 여행지에서 하루 종일 실내만
     도는 일정은 사용자가 기대한 것이 아니다.
     """
+    if pop is None:
+        return 0.0  # no weather weighting; precipitation remains unknown
     if pop >= 70:
         return 0.7
     if pop >= 50:
@@ -938,10 +989,9 @@ async def search_places(state: AgentState) -> AgentState:
       이동수단은 코스 후보를 걷기/자전거로 거르는 데, 테마는 검색어로
       전달한다.
 
-    저하 처리(하드 실패 아님):
-      호출이 실패하거나 후보가 비면 `state["error"]` 를 세우지 않고
-      `state["grounded"]=False`, `state["candidates"]=[]` 로 둔다. 그러면
-      다음 노드가 LLM 단독 생성으로 폴백하되 결과를 저신뢰로 표시한다.
+    호출 실패는 안전한 실패 코드로 종료한다. 정상 응답의 빈 후보는
+    다음 선정 노드에서 no_matching_places로 구분한다. 장소를 창작하거나
+    요청 지역·테마를 확대하지 않는다.
 
     호출처: LangGraph(fetch_weather 다음).
     """
@@ -969,17 +1019,23 @@ async def search_places(state: AgentState) -> AgentState:
     except (httpx.HTTPError, ValueError) as e:
         # 전송 실패뿐 아니라 200 응답이 JSON 으로 디코드되지 않는 경우
         # (json 디코드 오류는 ValueError 하위)도 저하로 흡수한다.
-        logger.warning("search_places degraded: %s", type(e).__name__)
+        logger.warning("search_places failed: %s", type(e).__name__)
+        state.update(exception_failure(e))
+        if state["code"] == "generation_failed":
+            state.update(failure("upstream_unavailable"))
+        state["candidates"] = []
+        state["grounded"] = False
+        return state
+    if any(not isinstance(result, dict) or not isinstance(result.get("places"), list) for result in results):
+        state.update(failure("upstream_unavailable"))
         state["candidates"] = []
         state["grounded"] = False
         return state
     candidates = _merge_place_results(results)
     # Mode 1 재탐색(stage="mode1")의 exclude 반영: 직전 추천 장소의
     # content_id 를 후보에서 제거한다(재탐색 제외 목록). content_id
-    # 가 없는 후보는 대조 불가라 통과시킨다. 전량 제외되면 아래의 기존
-    # 저하 규칙(grounded=False → invent 폴백)을 그대로 탄다.
-    # 한계: invent 폴백은 LLM 창작 장소라 content_id 기반 exclude 를
-    # 적용할 수 없다(후속 결정 대상 — B2 amendment 문서 참조).
+    # 가 없는 후보는 대조 불가라 통과시킨다. 전량 제외되면 요청 조건을
+    # 바꾸지 않고 다음 선정 노드에서 no_matching_places로 종료한다.
     exclude = set(req.exclude or [])
     if exclude:
         candidates = [
@@ -1267,11 +1323,13 @@ async def score_and_rank(state: AgentState) -> AgentState:
     if plan_days:
         day_pop_max = max(
             (
-                int(d.get("precipitation_prob") or 0)
+                int(d["precipitation_prob"])
                 for d in plan_days
-                if isinstance(d, dict)
+                if isinstance(d, dict) and isinstance(d.get("precipitation_prob"), (int, float))
+                and not isinstance(d.get("precipitation_prob"), bool)
+                and 0 <= d["precipitation_prob"] <= 100
             ),
-            default=0,
+            default=None,
         )
     else:
         weather = state.get("weather") or {}
@@ -1281,7 +1339,8 @@ async def score_and_rank(state: AgentState) -> AgentState:
         pops = [
             d.get("precipitation_prob") for d in daily if isinstance(d, dict)
         ]
-        day_pop_max = max((p for p in pops if p is not None), default=0)
+        day_pop_max = max((p for p in pops if isinstance(p, (int, float))
+                           and not isinstance(p, bool) and 0 <= p <= 100), default=None)
     # 채점 대상 pois: content_id 가 있는 후보만. indoor_flag 는 Kakao
     # category_group_code 가 실내 성향 그룹에 속하는지로 판정, base_score 는
     # 현재 랭크 순서를 반영한 rank-decay(1.0 - 0.01*i) 에 테마 친화 가점을
@@ -1362,6 +1421,8 @@ async def recommend_places(state: AgentState) -> AgentState:
         pinned = await _verify_selected_places(state, state["request"].places)
         if state.get("error"):
             return state
+    # Canonical source IDs survive route reordering and place_id renumbering.
+    state["pinned_content_ids"] = [p.content_id for p in pinned if p.content_id]
     if pinned and not _remaining_targets(state, pinned):
         # 남길 장소가 그날 몫을 전부 채웠다. 더 뽑을 자리가 없다.
         state["places"] = pinned
@@ -1374,6 +1435,8 @@ async def recommend_places(state: AgentState) -> AgentState:
         state = await _select_places(state, candidates)
     else:
         state["error"] = "insufficient verified places: no search candidates"
+        state["code"] = "no_matching_places"
+        state["retryable"] = False
     if pinned and not state.get("error"):
         state["places"] = _merge_pinned(pinned, state.get("places") or [])
     if not state.get("error"):
@@ -1383,6 +1446,8 @@ async def recommend_places(state: AgentState) -> AgentState:
             for day in range(1, _num_days(state["request"]) + 1)
         ):
             state["error"] = "insufficient verified places for the requested days"
+            state["code"] = "selection_invalid"
+            state["retryable"] = False
     return state
 
 
@@ -1665,10 +1730,10 @@ async def _select_places(
         )
     except Exception as e:
         logger.warning(
-            "recommend_places(select) failed job_id=%s err=%s: %s",
-            state.get("job_id"), type(e).__name__, e,
+            "recommend_places(select) failed job_id=%s cause=%s",
+            state.get("job_id"), type(e).__name__,
         )
-        state["error"] = f"recommend_places failed: {e}"
+        state.update(exception_failure(e))
         return state
 
     # 일차 범위를 벗어난 선택은 잡을 죽이지 않고 건너뛴다 — 이 경로는
@@ -1719,6 +1784,8 @@ async def _select_places(
             len(envelope.selections), len(chosen),
         )
         state["error"] = "insufficient verified places: selection returned empty"
+        state["code"] = "selection_invalid"
+        state["retryable"] = False
         return state
     state["places"] = places
     return state
@@ -1755,6 +1822,8 @@ async def recommend_route(state: AgentState) -> AgentState:
     places = state["places"]
     if not places:
         state["error"] = "recommend_route has no places"
+        state["code"] = "selection_invalid"
+        state["retryable"] = False
         return state
 
     req = state["request"]
@@ -2161,9 +2230,14 @@ async def fit_time_budget(state: AgentState) -> AgentState:
         return state
 
     # 수동으로 정한 방문지를 시간에 맞춘다는 이유로 몰래 삭제하지 않는다.
-    if state["request"].stage == "route":
+    request = state["request"]
+    if request.stage == "route" or (
+        request.stage == "mode1" and request.places and "pinned_content_ids" not in state
+    ):
         state["timeline_status"] = "unverified"
         state["error"] = "selected places exceed the activity time budget"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
 
     places = state.get("places") or []
@@ -2174,6 +2248,7 @@ async def fit_time_budget(state: AgentState) -> AgentState:
     }
     order = list(state.get("visit_order") or [])
     by_id = {p.place_id: p for p in places}
+    pinned_ids = set(state.get("pinned_content_ids") or [])
 
     # hub 룰과 같은 하한을 쓴다. 값이 어긋나면 여기서 줄인 결과가 룰이
     # 허용하지 않는 체류시간이 된다.
@@ -2199,7 +2274,11 @@ async def fit_time_budget(state: AgentState) -> AgentState:
                 break
             if len(day_order) <= keep_min:
                 break
-            removed = day_order.pop()
+            removed = next((pid for pid in reversed(day_order)
+                            if by_id[pid].content_id not in pinned_ids), None)
+            if removed is None:
+                break
+            day_order.remove(removed)
             dropped.add(removed)
         del trial_timeline
 
@@ -2214,6 +2293,8 @@ async def fit_time_budget(state: AgentState) -> AgentState:
         state["timeline_status"] = "unverified"
         state["timeline_overflow_days"] = still_overflowed
         state["error"] = "verified places exceed the activity time budget"
+        state["code"] = "invalid_request"
+        state["retryable"] = False
         return state
     for pid, slot in timeline.items():
         old = (state.get("timeline") or {}).get(pid) or {}
@@ -2496,7 +2577,8 @@ async def publish_done(state: AgentState) -> AgentState:
             job_id, state["error"], state.get("degraded_reason"),
         )
         payload = JobDonePayload(
-            job_id=job_id, status="failed", error=state["error"]
+            job_id=job_id, status="failed",
+            **failure(state.get("code", "generation_failed"), state.get("retryable", False))
         )
     else:
         warnings = state.get("warnings") or None

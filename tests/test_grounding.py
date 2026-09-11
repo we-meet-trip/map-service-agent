@@ -150,7 +150,7 @@ def test_search_places_degraded_on_error():
         out = asyncio.run(search_places(state))
     finally:
         deps.reset_all()
-    assert out.get("error") is None
+    assert out.get("error") is not None
     assert out["grounded"] is False
     assert out["candidates"] == []
 
@@ -221,7 +221,7 @@ def test_search_places_degraded_on_value_error():
         out = asyncio.run(search_places(state))
     finally:
         deps.reset_all()
-    assert out.get("error") is None
+    assert out.get("error") is not None
     assert out["grounded"] is False
     assert out["candidates"] == []
 

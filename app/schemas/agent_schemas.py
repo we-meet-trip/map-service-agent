@@ -610,3 +610,5 @@ class JobDonePayload(BaseModel):
     ] = None
     warnings: Optional[List[str]] = None
     error: Optional[str] = None
+    code: Optional[str] = None
+    retryable: Optional[bool] = None

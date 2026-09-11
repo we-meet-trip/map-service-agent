@@ -234,5 +234,6 @@ def test_recommend_places_merges_pins_with_selection() -> None:
     assert gemini.calls == 1
     assert [p.name for p in places] == ["남길곳", "새장소7", "새장소8"]
     assert [p.place_id for p in places] == [0, 1, 2]
+    assert out["pinned_content_ids"] == ["kakao:1"]
     # 남길 장소 하나를 뺀 두 자리만 뽑도록 계획이 줄어 있어야 한다.
     assert state["plan"]["days"][0]["target_stops"] == 2
